@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: freerun-ws
+    runtime: python
+    buildCommand: pip install websockets numpy
+    startCommand: python server.py
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+
+  - type: web
+    name: freerun-web
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port 10000 --server.address 0.0.0.0
+    envVars:
+      - key: WS_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.6"

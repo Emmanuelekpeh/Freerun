@@ -8,7 +8,8 @@ import time
 import streamlit as st
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-SERVER_PORT = 8765
+SERVER_PORT = int(os.environ.get("PORT", 8765))
+WS_EXTERNAL_URL = os.environ.get("WS_URL", "")
 METRICS_PATH = os.path.join(APP_DIR, "training_metrics.json")
 
 
@@ -154,7 +155,8 @@ if st.session_state.page == "lobby":
                     st.session_state.player_name = name.strip()
                     st.session_state.game_mode = mode
                     st.session_state.page = "game"
-                    start_server()
+                    if not WS_EXTERNAL_URL:
+                        start_server()
                     st.rerun()
                 else:
                     st.warning("Enter a name first.")
@@ -175,12 +177,16 @@ elif st.session_state.page == "game":
     with open(client_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    ws_host = get_local_ip()
     player_name = st.session_state.get("player_name", "Player")
     game_mode = st.session_state.get("game_mode", "classic")
 
+    if WS_EXTERNAL_URL:
+        ws_url = WS_EXTERNAL_URL
+    else:
+        ws_url = f"ws://{get_local_ip()}:{SERVER_PORT}"
+
     html = html.replace("__PLAYER_NAME__", player_name.replace('"', '\\"'))
-    html = html.replace("__WS_HOST__", ws_host)
+    html = html.replace("__WS_URL__", ws_url)
     html = html.replace("__GAME_MODE__", game_mode)
 
     st.components.v1.html(html, height=760, scrolling=False)

@@ -23,8 +23,7 @@
 <script>
 (function() {
   const PLAYER_NAME = "__PLAYER_NAME__";
-  const WS_HOST     = "__WS_HOST__";
-  const WS_PORT     = 8765;
+  const WS_URL      = "__WS_URL__";
   const TILE_SIZE   = 32;
   const PLAYER_R    = 12;
   const GAME_MODE   = "__GAME_MODE__";
@@ -84,7 +83,7 @@
 
   // ─── WebSocket ──────────────────────────────────────────────────
   function connect() {
-    const url = 'ws://' + WS_HOST + ':' + WS_PORT;
+    const url = WS_URL;
     ws = new WebSocket(url);
 
     ws.onopen = function() {

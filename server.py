@@ -11,7 +11,7 @@ from engine import GameEngine, TICK_RATE, TICK_DT
 from bots import ScriptedBot, RLBot
 
 HOST = "0.0.0.0"
-PORT = 8765
+PORT = int(os.environ.get("PORT", 8765))
 MIN_PLAYERS = 4
 MAX_PLAYERS = 8
 ROOM_IDLE_TIMEOUT = 30.0
