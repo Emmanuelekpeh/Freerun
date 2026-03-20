@@ -1,8 +1,10 @@
 import asyncio
+import http
 import json
 import os
 import random
 import time
+import urllib.parse
 import uuid
 
 import websockets
@@ -12,6 +14,7 @@ from bots import ScriptedBot, RLBot
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8765))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MIN_PLAYERS = 4
 MAX_PLAYERS = 8
 ROOM_IDLE_TIMEOUT = 30.0
@@ -273,11 +276,94 @@ class GameServer:
                 await asyncio.sleep(sleep_time)
 
 
+# ─── Built-in HTTP serving (for Render / standalone) ─────────────────
+
+_LOBBY_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Freerun</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e17;color:#fff;font-family:'Segoe UI',sans-serif;
+display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh}
+h1{letter-spacing:6px;font-size:48px;margin-bottom:4px}
+p.sub{color:#556;font-size:14px;margin-bottom:40px}
+form{display:flex;flex-direction:column;gap:14px;width:280px}
+input{padding:12px;border:1px solid #334;border-radius:8px;background:#141a26;
+color:#fff;font-size:16px;outline:none}
+input:focus{border-color:#00ff96}
+.modes{display:flex;gap:10px}
+.modes label{flex:1;text-align:center;padding:10px;border:1px solid #334;
+border-radius:8px;cursor:pointer;font-size:14px;transition:0.2s}
+.modes input[type=radio]{display:none}
+.modes input[type=radio]:checked+span{color:#00ff96}
+.modes label:has(input:checked){border-color:#00ff96;background:#0d1a12}
+button{padding:14px;border:none;border-radius:8px;background:#00ff96;color:#0a0e17;
+font-size:18px;font-weight:bold;cursor:pointer;letter-spacing:2px}
+button:hover{background:#00cc78}
+.hint{color:#334;font-size:11px;margin-top:30px;text-align:center}
+</style></head><body>
+<h1>FREERUN</h1><p class="sub">infinite tag</p>
+<form action="/play" method="GET">
+<input name="name" placeholder="Enter a name..." maxlength="16" required autocomplete="off">
+<div class="modes">
+<label><input type="radio" name="mode" value="classic" checked><span>Classic</span></label>
+<label><input type="radio" name="mode" value="infestation"><span>Infestation</span></label>
+</div>
+<button type="submit">PLAY</button>
+</form>
+<p class="hint">WASD move &middot; SPACE dash &middot; E break</p>
+</body></html>"""
+
+
+def _build_game_html(name, mode, ws_url):
+    path = os.path.join(SCRIPT_DIR, "client.html")
+    with open(path, "r", encoding="utf-8") as f:
+        html = f.read()
+    html = html.replace("__PLAYER_NAME__", name.replace('"', '\\"'))
+    html = html.replace("__WS_URL__", ws_url)
+    html = html.replace("__GAME_MODE__", mode)
+    return html
+
+
+async def _http_handler(path, request_headers):
+    if path == "/" or path == "":
+        return http.HTTPStatus.OK, [("Content-Type", "text/html")], _LOBBY_HTML.encode()
+
+    if path.startswith("/play"):
+        parsed = urllib.parse.urlparse(path)
+        params = urllib.parse.parse_qs(parsed.query)
+        name = params.get("name", ["Player"])[0][:16]
+        mode = params.get("mode", ["classic"])[0]
+        if mode not in ("classic", "infestation"):
+            mode = "classic"
+
+        host_header = None
+        for h_name, h_val in request_headers.raw_items():
+            if h_name.lower() == "host":
+                host_header = h_val
+                break
+
+        if host_header:
+            proto = "wss" if "onrender.com" in host_header or "https" in str(request_headers) else "ws"
+            ws_url = f"{proto}://{host_header}"
+        else:
+            ws_url = f"ws://localhost:{PORT}"
+
+        html = _build_game_html(name, mode, ws_url)
+        return http.HTTPStatus.OK, [("Content-Type", "text/html")], html.encode()
+
+    return http.HTTPStatus.NOT_FOUND, [], b"Not Found"
+
+
 async def main():
     server = GameServer()
-    async with websockets.serve(server.handle_client, HOST, PORT):
-        stats = server.manager.stats
-        print(f"Freerun server running on ws://{HOST}:{PORT}")
+    async with websockets.serve(
+        server.handle_client, HOST, PORT,
+        process_request=_http_handler,
+    ):
+        print(f"Freerun server running on http://{HOST}:{PORT}")
         await server.game_loop()
 
 
