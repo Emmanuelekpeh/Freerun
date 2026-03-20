@@ -110,6 +110,8 @@ class Player:
     dash_ticks_left: int = 0
     break_cooldown: float = 0.0
     it_ticks: int = 0
+    last_tagged_by: str = ""
+    tagged_by_timer: float = 0.0
 
 
 class Chunk:
@@ -441,6 +443,10 @@ class GameEngine:
                 p.tag_cooldown -= TICK_DT
             if p.dash_cooldown > 0:
                 p.dash_cooldown -= TICK_DT
+            if p.tagged_by_timer > 0:
+                p.tagged_by_timer -= TICK_DT
+                if p.tagged_by_timer <= 0:
+                    p.last_tagged_by = ""
             if p.break_cooldown > 0:
                 p.break_cooldown -= TICK_DT
 
@@ -465,6 +471,8 @@ class GameEngine:
                         b.is_it = True
                         b.tag_cooldown = TAG_COOLDOWN
                         a.tag_cooldown = TAG_COOLDOWN * 0.4
+                        b.last_tagged_by = a.id
+                        b.tagged_by_timer = 6.0
                         self.events.append({
                             "type": "tag",
                             "tagger_id": a.id,
@@ -499,6 +507,9 @@ class GameEngine:
                         a.is_it = False
                         b.is_it = True
                         b.tag_cooldown = TAG_COOLDOWN
+                        b.last_tagged_by = a.id
+                        b.tagged_by_timer = 6.0
+                        a.it_ticks = 0
                         self.events.append({
                             "type": "tag",
                             "tagger_id": a.id,
@@ -608,13 +619,18 @@ class GameEngine:
             "dash_cooldown": p.dash_cooldown,
             "break_cooldown": p.break_cooldown,
             "is_dashing": p.dash_ticks_left > 0,
+            "it_ticks": p.it_ticks,
+            "last_tagged_by": p.last_tagged_by,
             "nearest": [
                 {
+                    "id": o.id,
                     "dx": o.x - p.x,
                     "dy": o.y - p.y,
                     "vx": o.vx,
                     "vy": o.vy,
                     "is_it": o.is_it,
+                    "dash_cd": o.dash_cooldown,
+                    "is_dashing": o.dash_ticks_left > 0,
                 }
                 for o in nearest
             ],

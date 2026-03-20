@@ -10,14 +10,45 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
-class ScriptedBot:
-    """Rule-based bot brain. Returns (dx, dy, dash, do_break)."""
+PERSONALITY_TYPES = ("hunter", "strategist", "trickster", "timid")
 
-    def __init__(self):
-        self.aggression = random.uniform(0.5, 1.0)
+
+class ScriptedBot:
+    """Rule-based bot brain with personality. Returns (dx, dy, dash, do_break)."""
+
+    def __init__(self, personality: str = None):
+        self.personality = personality or random.choice(PERSONALITY_TYPES)
         self.jitter_angle = 0.0
         self.jitter_timer = 0.0
         self.wander_angle = random.uniform(0, 2 * math.pi)
+        self._locked_target_id = None
+        self._target_lock_timer = 0.0
+        self._patience_timer = 0.0
+
+        if self.personality == "hunter":
+            self.aggression = random.uniform(0.8, 1.0)
+            self.tagback_aversion = 0.9
+            self.target_switch_chance = 0.02
+            self.dash_eagerness = 0.4
+            self.patience = random.uniform(0.0, 1.5)
+        elif self.personality == "strategist":
+            self.aggression = random.uniform(0.5, 0.75)
+            self.tagback_aversion = 0.95
+            self.target_switch_chance = 0.08
+            self.dash_eagerness = 0.15
+            self.patience = random.uniform(2.0, 5.0)
+        elif self.personality == "trickster":
+            self.aggression = random.uniform(0.6, 0.85)
+            self.tagback_aversion = 0.7
+            self.target_switch_chance = 0.15
+            self.dash_eagerness = 0.5
+            self.patience = random.uniform(0.5, 2.0)
+        else:  # timid
+            self.aggression = random.uniform(0.3, 0.55)
+            self.tagback_aversion = 0.4
+            self.target_switch_chance = 0.05
+            self.dash_eagerness = 0.2
+            self.patience = random.uniform(3.0, 8.0)
 
     def get_action(self, observation: dict) -> Tuple[float, float, bool, bool]:
         if not observation or not observation.get("nearest"):
@@ -29,6 +60,9 @@ class ScriptedBot:
             self.jitter_angle = random.uniform(-0.4, 0.4)
             self.jitter_timer = random.uniform(0.3, 0.8)
 
+        self._target_lock_timer = max(0, self._target_lock_timer - 0.05)
+        self._patience_timer = max(0, self._patience_timer - 0.05)
+
         if observation["is_it"]:
             return self._chase(observation)
         return self._flee(observation)
@@ -37,31 +71,99 @@ class ScriptedBot:
         self.wander_angle += random.uniform(-0.2, 0.2)
         return (math.cos(self.wander_angle) * 0.4, math.sin(self.wander_angle) * 0.4)
 
+    # ── Target scoring ────────────────────────────────────────────────
+
+    def _score_target(self, obs: dict, target: dict) -> float:
+        dx, dy = target["dx"], target["dy"]
+        dist = math.sqrt(dx * dx + dy * dy) or 1.0
+
+        score = 1000.0 / (dist + 10.0)
+
+        if target.get("id") == obs.get("last_tagged_by"):
+            score *= (1.0 - self.tagback_aversion)
+
+        if target.get("dash_cd", 0) > 1.0:
+            score *= 1.5
+        if target.get("is_dashing"):
+            score *= 0.3
+
+        my_vx = obs.get("self_vx", 0)
+        my_vy = obs.get("self_vy", 0)
+        speed = math.sqrt(my_vx * my_vx + my_vy * my_vy)
+        if speed > 0.5:
+            dot = (my_vx * dx + my_vy * dy) / (speed * dist)
+            score *= (1.0 + dot * 0.4)
+
+        if target.get("id") == self._locked_target_id and self._target_lock_timer > 0:
+            score *= 1.6
+
+        return score
+
+    def _pick_target(self, obs: dict) -> dict:
+        candidates = [n for n in obs["nearest"] if not n["is_it"]]
+        if not candidates:
+            return None
+
+        if self._target_lock_timer > 0 and random.random() > self.target_switch_chance:
+            for c in candidates:
+                if c.get("id") == self._locked_target_id:
+                    return c
+
+        scored = [(self._score_target(obs, c), c) for c in candidates]
+        scored.sort(key=lambda x: -x[0])
+
+        if self.personality == "trickster" and len(scored) > 1:
+            if random.random() < 0.3:
+                pick = scored[1][1]
+            else:
+                pick = scored[0][1]
+        else:
+            pick = scored[0][1]
+
+        self._locked_target_id = pick.get("id")
+        self._target_lock_timer = random.uniform(1.5, 4.0)
+        return pick
+
+    # ── Chase ─────────────────────────────────────────────────────────
+
     def _chase(self, obs: dict) -> Tuple[float, float, bool, bool]:
-        targets = [n for n in obs["nearest"] if not n["is_it"]]
-        if not targets:
+        target = self._pick_target(obs)
+        if not target:
             dx, dy = self._wander()
             return dx, dy, False, False
 
-        t = targets[0]
-        dx, dy = t["dx"], t["dy"]
+        dx, dy = target["dx"], target["dy"]
         dist = math.sqrt(dx * dx + dy * dy) or 0.01
 
-        pred_dx = dx + t["vx"] * 3.0 * self.aggression
-        pred_dy = dy + t["vy"] * 3.0 * self.aggression
+        if self._patience_timer > 0 and dist < 120:
+            return self._stalk(obs, target)
+
+        tvx, tvy = target.get("vx", 0), target.get("vy", 0)
+        pred_factor = min(3.0, dist / 40.0) * self.aggression
+        pred_dx = dx + tvx * pred_factor
+        pred_dy = dy + tvy * pred_factor
         pred_dist = math.sqrt(pred_dx * pred_dx + pred_dy * pred_dy) or 0.01
 
         base_angle = math.atan2(pred_dy, pred_dx)
+
+        if self.personality == "strategist" and dist > 80:
+            flank = math.pi * 0.15 * (1 if random.random() > 0.5 else -1)
+            base_angle += flank
+
         angle = base_angle + self.jitter_angle * 0.3
         mag = min(1.0, self.aggression + 0.2)
         move_dx = math.cos(angle) * mag
         move_dy = math.sin(angle) * mag
 
         dash = (
-            dist < 80
+            dist < 90
             and obs.get("dash_cooldown", 1) <= 0
-            and random.random() < 0.3
+            and random.random() < self.dash_eagerness
+            and not target.get("is_dashing")
         )
+
+        if dist < 60 and self.patience > 0 and random.random() < 0.04:
+            self._patience_timer = self.patience
 
         do_break = (
             obs.get("break_cooldown", 1) <= 0
@@ -70,21 +172,53 @@ class ScriptedBot:
         )
         return move_dx, move_dy, dash, do_break
 
+    def _stalk(self, obs: dict, target: dict) -> Tuple[float, float, bool, bool]:
+        """Maintain distance, circling the target before striking."""
+        dx, dy = target["dx"], target["dy"]
+        dist = math.sqrt(dx * dx + dy * dy) or 0.01
+        nx, ny = dx / dist, dy / dist
+
+        perp_x, perp_y = -ny, nx
+        if random.random() < 0.5:
+            perp_x, perp_y = ny, -nx
+
+        if dist < 50:
+            self._patience_timer = 0
+            move_dx = nx * 1.0
+            move_dy = ny * 1.0
+            dash = obs.get("dash_cooldown", 1) <= 0 and random.random() < self.dash_eagerness
+            return move_dx, move_dy, dash, False
+
+        toward = 0.2 if dist > 100 else -0.1
+        move_dx = perp_x * 0.7 + nx * toward
+        move_dy = perp_y * 0.7 + ny * toward
+        mag = math.sqrt(move_dx * move_dx + move_dy * move_dy) or 1
+        move_dx = move_dx / mag * 0.6
+        move_dy = move_dy / mag * 0.6
+        return move_dx, move_dy, False, False
+
+    # ── Flee ──────────────────────────────────────────────────────────
+
     def _flee(self, obs: dict) -> Tuple[float, float, bool, bool]:
         threats = [n for n in obs["nearest"] if n["is_it"]]
         if not threats:
             dx, dy = self._wander()
             return dx, dy, False, False
 
-        threat = threats[0]
-        dx, dy = threat["dx"], threat["dy"]
-        dist = math.sqrt(dx * dx + dy * dy) or 0.01
+        flee_x, flee_y = 0.0, 0.0
+        for t in threats:
+            tdx, tdy = t["dx"], t["dy"]
+            d = math.sqrt(tdx * tdx + tdy * tdy) or 1.0
+            weight = 1.0 / (d + 1.0)
+            flee_x -= (tdx / d) * weight
+            flee_y -= (tdy / d) * weight
 
-        flee_x = -dx / dist
-        flee_y = -dy / dist
+        mag = math.sqrt(flee_x * flee_x + flee_y * flee_y)
+        if mag > 0:
+            flee_x /= mag
+            flee_y /= mag
 
         avoid_x, avoid_y = self._avoid_walls(obs)
-
         move_x = flee_x * 0.7 + avoid_x * 0.3
         move_y = flee_y * 0.7 + avoid_y * 0.3
 
@@ -93,19 +227,23 @@ class ScriptedBot:
         move_dx = math.cos(angle) * mag
         move_dy = math.sin(angle) * mag
 
+        closest = threats[0]
+        cdist = math.sqrt(closest["dx"] ** 2 + closest["dy"] ** 2)
         dash = (
-            dist < 60
+            cdist < 65
             and obs.get("dash_cooldown", 1) <= 0
-            and random.random() < 0.4
+            and random.random() < 0.45
         )
 
         do_break = (
             obs.get("break_cooldown", 1) <= 0
-            and dist < 100
+            and cdist < 100
             and self._walls_ahead(obs, move_dx, move_dy)
             and random.random() < 0.5
         )
         return move_dx, move_dy, dash, do_break
+
+    # ── Helpers ───────────────────────────────────────────────────────
 
     @staticmethod
     def _walls_ahead(obs: dict, move_dx: float, move_dy: float) -> bool:
