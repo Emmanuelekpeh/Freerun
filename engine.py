@@ -19,6 +19,8 @@ IT_SPEED_BONUS = 1.15
 DASH_SPEED = 20.0
 DASH_COOLDOWN = 3.5
 DASH_TICKS = 3
+MAX_DASH_CHARGES = 3
+DASH_ORB_CHANCE = 0.035
 
 # ─── Break Constants ─────────────────────────────────────────────────
 BREAK_RADIUS = 48
@@ -108,6 +110,7 @@ class Player:
     tag_cooldown: float = 0.0
     dash_cooldown: float = 0.0
     dash_ticks_left: int = 0
+    dash_charges: int = 0
     break_cooldown: float = 0.0
     it_ticks: int = 0
     last_tagged_by: str = ""
@@ -115,7 +118,7 @@ class Player:
 
 
 class Chunk:
-    __slots__ = ("cx", "cy", "wall_grid", "_walls_cache")
+    __slots__ = ("cx", "cy", "wall_grid", "dash_tiles", "_walls_cache")
 
     def __init__(self, cx: int, cy: int):
         self.cx = cx
@@ -123,6 +126,7 @@ class Chunk:
         self.wall_grid: List[List[bool]] = [
             [False] * TILES_PER_CHUNK for _ in range(TILES_PER_CHUNK)
         ]
+        self.dash_tiles: set = set()
         self._walls_cache: Optional[List[Tuple[float, float, float, float]]] = None
 
     def get_walls(self) -> List[Tuple[float, float, float, float]]:
@@ -141,6 +145,14 @@ class Chunk:
                         ))
             self._walls_cache = walls
         return self._walls_cache
+
+    def get_dash_tile_positions(self) -> List[Tuple[float, float, float, float]]:
+        base_x = self.cx * CHUNK_SIZE
+        base_y = self.cy * CHUNK_SIZE
+        return [
+            (base_x + tx * TILE_SIZE, base_y + ty * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+            for (tx, ty) in self.dash_tiles
+        ]
 
 
 # ─── Game Engine ─────────────────────────────────────────────────────
@@ -207,7 +219,10 @@ class GameEngine:
         if player_id not in self.players:
             return
         p = self.players[player_id]
-        if p.dash_cooldown > 0 or p.dash_ticks_left > 0:
+        if p.dash_ticks_left > 0:
+            return
+        has_charge = p.dash_charges > 0
+        if not has_charge and p.dash_cooldown > 0:
             return
         ix, iy = p.input_dx, p.input_dy
         imag = math.sqrt(ix * ix + iy * iy)
@@ -221,7 +236,10 @@ class GameEngine:
         p.vx = ix * DASH_SPEED
         p.vy = iy * DASH_SPEED
         p.dash_ticks_left = DASH_TICKS
-        p.dash_cooldown = DASH_COOLDOWN
+        if has_charge:
+            p.dash_charges -= 1
+        else:
+            p.dash_cooldown = DASH_COOLDOWN
 
     def trigger_break(self, player_id: str):
         if player_id not in self.players:
@@ -232,6 +250,7 @@ class GameEngine:
 
         p.break_cooldown = BREAK_COOLDOWN
         destroyed = []
+        orbs_collected = []
 
         center_tx = int(math.floor(p.x / TILE_SIZE))
         center_ty = int(math.floor(p.y / TILE_SIZE))
@@ -259,6 +278,21 @@ class GameEngine:
                     chunk.wall_grid[local_ty][local_tx] = False
                     chunk._walls_cache = None
                     destroyed.append([wtx * TILE_SIZE, wty * TILE_SIZE, TILE_SIZE, TILE_SIZE])
+
+                    if (local_tx, local_ty) in chunk.dash_tiles:
+                        chunk.dash_tiles.discard((local_tx, local_ty))
+                        orbs_collected.append([wtx * TILE_SIZE, wty * TILE_SIZE])
+
+        if orbs_collected and p.dash_charges < MAX_DASH_CHARGES:
+            gained = min(len(orbs_collected), MAX_DASH_CHARGES - p.dash_charges)
+            p.dash_charges += gained
+            self.events.append({
+                "type": "dash_orb",
+                "player_id": player_id,
+                "player_name": p.name,
+                "charges": p.dash_charges,
+                "positions": orbs_collected,
+            })
 
         if destroyed:
             self.events.append({
@@ -334,6 +368,20 @@ class GameEngine:
 
                 if is_wall:
                     chunk.wall_grid[ty][tx] = True
+
+        rng = random.Random(self.seed ^ (cx * 73856093) ^ (cy * 19349663))
+        for ty in range(1, TILES_PER_CHUNK - 1):
+            for tx in range(1, TILES_PER_CHUNK - 1):
+                if not chunk.wall_grid[ty][tx]:
+                    continue
+                neighbors = (
+                    chunk.wall_grid[ty - 1][tx]
+                    and chunk.wall_grid[ty + 1][tx]
+                    and chunk.wall_grid[ty][tx - 1]
+                    and chunk.wall_grid[ty][tx + 1]
+                )
+                if neighbors and rng.random() < DASH_ORB_CHANCE:
+                    chunk.dash_tiles.add((tx, ty))
 
         self.chunks[key] = chunk
         return chunk
@@ -563,6 +611,7 @@ class GameEngine:
                     "is_it": p.is_it,
                     "is_bot": p.is_bot,
                     "dash_cd": round(max(0, p.dash_cooldown), 2),
+                    "dash_charges": p.dash_charges,
                     "dashing": p.dash_ticks_left > 0,
                     "break_cd": round(max(0, p.break_cooldown), 2),
                 }
@@ -582,6 +631,7 @@ class GameEngine:
                     "cx": chunk.cx,
                     "cy": chunk.cy,
                     "walls": chunk.get_walls(),
+                    "dash_tiles": chunk.get_dash_tile_positions(),
                 })
         return {"type": "chunks", "chunks": chunks_out}
 
@@ -609,6 +659,23 @@ class GameEngine:
                         TILE_SIZE,
                     ))
 
+        nearby_orbs = []
+        for dtx in range(-5, 6):
+            for dty in range(-5, 6):
+                wtx = tile_x + dtx
+                wty = tile_y + dty
+                cx_o = wtx // TILES_PER_CHUNK
+                cy_o = wty // TILES_PER_CHUNK
+                chunk_o = self.chunks.get((cx_o, cy_o))
+                if chunk_o:
+                    ltx = wtx % TILES_PER_CHUNK
+                    lty = wty % TILES_PER_CHUNK
+                    if (ltx, lty) in chunk_o.dash_tiles:
+                        nearby_orbs.append((
+                            wtx * TILE_SIZE + TILE_SIZE * 0.5 - p.x,
+                            wty * TILE_SIZE + TILE_SIZE * 0.5 - p.y,
+                        ))
+
         return {
             "self_x": p.x,
             "self_y": p.y,
@@ -617,10 +684,12 @@ class GameEngine:
             "is_it": p.is_it,
             "tag_cooldown": p.tag_cooldown,
             "dash_cooldown": p.dash_cooldown,
+            "dash_charges": p.dash_charges,
             "break_cooldown": p.break_cooldown,
             "is_dashing": p.dash_ticks_left > 0,
             "it_ticks": p.it_ticks,
             "last_tagged_by": p.last_tagged_by,
+            "nearby_orbs": nearby_orbs,
             "nearest": [
                 {
                     "id": o.id,

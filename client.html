@@ -34,6 +34,7 @@
   let currPlayers = {};
   let lastStateTime = 0;
   let chunks = {};
+  let dashTiles = {};
   let inputDx = 0, inputDy = 0;
   let keys = {};
   let connected = false;
@@ -157,8 +158,26 @@
                 return !(w[0] === d[0] && w[1] === d[1]);
               });
             }
+            if (dashTiles[key]) {
+              dashTiles[key] = dashTiles[key].filter(function(dt) {
+                return !(dt[0] === d[0] && dt[1] === d[1]);
+              });
+            }
           }
           if (ev.player_id === myId) shake = 3;
+        } else if (ev.type === 'dash_orb') {
+          for (const pos of ev.positions) {
+            for (var oi = 0; oi < 12; oi++) {
+              var oa = Math.random() * Math.PI * 2;
+              var ospd = 1 + Math.random() * 3;
+              particles.push({ x: pos[0] + 16, y: pos[1] + 16, vx: Math.cos(oa) * ospd, vy: Math.sin(oa) * ospd, life: 1.0, color: '#00ff96', size: 5 });
+            }
+          }
+          if (ev.player_id === myId) {
+            notifications.push({ text: 'DASH +' + ev.positions.length + ' (' + ev.charges + '/' + 3 + ')', time: 2.0, isMe: true });
+          } else {
+            notifications.push({ text: ev.player_name + ' got dash orb', time: 1.5, isMe: false });
+          }
         }
       }
     }
@@ -166,7 +185,9 @@
 
   function handleChunks(msg) {
     for (const c of msg.chunks) {
-      chunks[c.cx + ',' + c.cy] = c.walls;
+      var key = c.cx + ',' + c.cy;
+      chunks[key] = c.walls;
+      dashTiles[key] = c.dash_tiles || [];
     }
   }
 
@@ -368,6 +389,33 @@
       }
     }
 
+    // Dash orb tiles (green glow)
+    var orbPulse = 0.7 + 0.3 * Math.sin(Date.now() * 0.004);
+    for (var key in dashTiles) {
+      var dts = dashTiles[key];
+      for (var i = 0; i < dts.length; i++) {
+        var dt = dts[i];
+        var dtx = dt[0], dty = dt[1], dtw = dt[2], dth = dt[3];
+        if (dtx + dtw < viewL || dtx > viewR || dty + dth < viewT || dty > viewB) continue;
+        var dsp = worldToScreen(dtx, dty);
+        ctx.fillStyle = 'rgba(0,255,150,' + (0.25 * orbPulse).toFixed(2) + ')';
+        ctx.fillRect(dsp[0], dsp[1], dtw, dth);
+        ctx.strokeStyle = 'rgba(0,255,150,' + (0.6 * orbPulse).toFixed(2) + ')';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(dsp[0] + 2, dsp[1] + 2, dtw - 4, dth - 4);
+        // Center diamond icon
+        var cx = dsp[0] + dtw * 0.5, cy = dsp[1] + dth * 0.5;
+        ctx.fillStyle = 'rgba(0,255,150,' + (0.8 * orbPulse).toFixed(2) + ')';
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - 7);
+        ctx.lineTo(cx + 5, cy);
+        ctx.lineTo(cx, cy + 7);
+        ctx.lineTo(cx - 5, cy);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+
     // Particles
     for (var i = 0; i < particles.length; i++) {
       var p = particles[i];
@@ -560,7 +608,7 @@
     // Dash cooldown (desktop HUD)
     if (me && !isMobile) {
       var dashCd = me.dash_cd || 0;
-      var dashReady = dashCd <= 0;
+      var dashReady = dashCd <= 0 || (me.dash_charges || 0) > 0;
       var hudX = W - 80;
       var hudY = H - 50;
 
@@ -589,6 +637,19 @@
       ctx.font = 'bold 10px "Segoe UI", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('DASH', hudX, hudY + 4);
+
+      // Dash charges (desktop)
+      var dCharges = me.dash_charges || 0;
+      if (dCharges > 0) {
+        for (var ci = 0; ci < dCharges; ci++) {
+          var cx = hudX - (dCharges - 1) * 5 + ci * 10;
+          var cy = hudY + 26;
+          ctx.fillStyle = '#00ff96';
+          ctx.beginPath();
+          ctx.moveTo(cx, cy - 4); ctx.lineTo(cx + 3, cy); ctx.lineTo(cx, cy + 4); ctx.lineTo(cx - 3, cy);
+          ctx.closePath(); ctx.fill();
+        }
+      }
 
       // Break cooldown (desktop)
       var breakCd = me.break_cd || 0;
@@ -725,7 +786,7 @@
       var dbx = canvas.width - 80;
       var dby = canvas.height - 100;
       var dashCdM = me ? (me.dash_cd || 0) : 0;
-      var dashReadyM = dashCdM <= 0;
+      var dashReadyM = dashCdM <= 0 || (me && (me.dash_charges || 0) > 0);
 
       ctx.beginPath();
       ctx.arc(dbx, dby, 38, 0, Math.PI * 2);
@@ -752,6 +813,19 @@
       ctx.font = 'bold 14px "Segoe UI", sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('DASH', dbx, dby + 5);
+
+      // Dash charges (mobile)
+      var dChM = me ? (me.dash_charges || 0) : 0;
+      if (dChM > 0) {
+        for (var mci = 0; mci < dChM; mci++) {
+          var mcx = dbx - (dChM - 1) * 6 + mci * 12;
+          var mcy = dby + 48;
+          ctx.fillStyle = '#00ff96';
+          ctx.beginPath();
+          ctx.moveTo(mcx, mcy - 5); ctx.lineTo(mcx + 4, mcy); ctx.lineTo(mcx, mcy + 5); ctx.lineTo(mcx - 4, mcy);
+          ctx.closePath(); ctx.fill();
+        }
+      }
 
       // Break button (mobile)
       var bbx = canvas.width - 80;

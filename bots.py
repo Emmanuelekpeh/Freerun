@@ -63,6 +63,10 @@ class ScriptedBot:
         self._target_lock_timer = max(0, self._target_lock_timer - 0.05)
         self._patience_timer = max(0, self._patience_timer - 0.05)
 
+        orb_action = self._seek_orb(observation)
+        if orb_action is not None:
+            return orb_action
+
         if observation["is_it"]:
             return self._chase(observation)
         return self._flee(observation)
@@ -70,6 +74,38 @@ class ScriptedBot:
     def _wander(self) -> Tuple[float, float]:
         self.wander_angle += random.uniform(-0.2, 0.2)
         return (math.cos(self.wander_angle) * 0.4, math.sin(self.wander_angle) * 0.4)
+
+    def _seek_orb(self, obs: dict):
+        orbs = obs.get("nearby_orbs", [])
+        if not orbs:
+            return None
+        if obs.get("dash_charges", 0) >= 3:
+            return None
+        if obs.get("break_cooldown", 1) > 0:
+            return None
+
+        threats = [n for n in obs.get("nearest", []) if n["is_it"]]
+        if threats:
+            closest_threat = min(
+                math.sqrt(t["dx"] ** 2 + t["dy"] ** 2) for t in threats
+            )
+            if closest_threat < 120:
+                return None
+
+        best = min(orbs, key=lambda o: o[0] ** 2 + o[1] ** 2)
+        odx, ody = best
+        odist = math.sqrt(odx * odx + ody * ody)
+        if odist > 140:
+            return None
+
+        if odist < 50:
+            ndx = odx / (odist or 1)
+            ndy = ody / (odist or 1)
+            return ndx * 0.6, ndy * 0.6, False, True
+
+        ndx = odx / odist
+        ndy = ody / odist
+        return ndx * 0.8, ndy * 0.8, False, False
 
     # ── Target scoring ────────────────────────────────────────────────
 
@@ -155,9 +191,10 @@ class ScriptedBot:
         move_dx = math.cos(angle) * mag
         move_dy = math.sin(angle) * mag
 
+        can_dash = obs.get("dash_cooldown", 1) <= 0 or obs.get("dash_charges", 0) > 0
         dash = (
             dist < 90
-            and obs.get("dash_cooldown", 1) <= 0
+            and can_dash
             and random.random() < self.dash_eagerness
             and not target.get("is_dashing")
         )
@@ -186,7 +223,8 @@ class ScriptedBot:
             self._patience_timer = 0
             move_dx = nx * 1.0
             move_dy = ny * 1.0
-            dash = obs.get("dash_cooldown", 1) <= 0 and random.random() < self.dash_eagerness
+            can_d = obs.get("dash_cooldown", 1) <= 0 or obs.get("dash_charges", 0) > 0
+            dash = can_d and random.random() < self.dash_eagerness
             return move_dx, move_dy, dash, False
 
         toward = 0.2 if dist > 100 else -0.1
@@ -229,9 +267,10 @@ class ScriptedBot:
 
         closest = threats[0]
         cdist = math.sqrt(closest["dx"] ** 2 + closest["dy"] ** 2)
+        can_dash_f = obs.get("dash_cooldown", 1) <= 0 or obs.get("dash_charges", 0) > 0
         dash = (
             cdist < 65
-            and obs.get("dash_cooldown", 1) <= 0
+            and can_dash_f
             and random.random() < 0.45
         )
 
