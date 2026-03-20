@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Freerun</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0e17; touch-action: none; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(10,14,23,0.85); color: #aaa; font-family: 'Segoe UI', sans-serif;
+    font-size: 18px; z-index: 10; pointer-events: none;
+  }
+  #overlay.hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="overlay"><span>Connecting...</span></div>
+<canvas id="game"></canvas>
+<script>
+(function() {
+  const PLAYER_NAME = "__PLAYER_NAME__";
+  const WS_HOST     = "__WS_HOST__";
+  const WS_PORT     = 8765;
+  const TILE_SIZE   = 32;
+  const PLAYER_R    = 12;
+  const GAME_MODE   = "__GAME_MODE__";
+
+  let ws = null;
+  let myId = null;
+  let prevPlayers = {};
+  let currPlayers = {};
+  let lastStateTime = 0;
+  let chunks = {};
+  let inputDx = 0, inputDy = 0;
+  let keys = {};
+  let connected = false;
+  let dashQueued = false;
+  let breakQueued = false;
+  let breakBtnTouched = false;
+
+  let camX = 0, camY = 0;
+  let particles = [];
+  const MAX_PARTICLES = 300;
+  let notifications = [];
+  let shake = 0;
+  let ping = null; // {dx, dy, timer}
+  let gameMode = GAME_MODE;
+  let roomId = '';
+  let survivors = 0;
+  let totalPlayers = 0;
+  let roundNum = 1;
+  let roundEnd = null; // {winner, timer}
+
+  const isMobile = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+  let joystick = { active: false, id: null, bx: 0, by: 0, tx: 0, ty: 0 };
+  let dashBtnTouched = false;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const overlay = document.getElementById('overlay');
+
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function worldToScreen(wx, wy) {
+    return [wx - camX + canvas.width * 0.5, wy - camY + canvas.height * 0.5];
+  }
+
+  function playerColor(id, isIt) {
+    if (isIt) return '#ff4444';
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = ((h << 5) - h) + id.charCodeAt(i);
+    const hue = ((h % 360) + 360) % 360;
+    return 'hsl(' + hue + ', 65%, 60%)';
+  }
+
+  // ─── WebSocket ──────────────────────────────────────────────────
+  function connect() {
+    const url = 'ws://' + WS_HOST + ':' + WS_PORT;
+    ws = new WebSocket(url);
+
+    ws.onopen = function() {
+      ws.send(JSON.stringify({ type: 'join', name: PLAYER_NAME, mode: GAME_MODE }));
+    };
+
+    ws.onmessage = function(e) {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'welcome') {
+        myId = msg.id;
+        gameMode = msg.mode || GAME_MODE;
+        roomId = msg.room || '';
+        connected = true;
+        overlay.classList.add('hidden');
+      } else if (msg.type === 'state') {
+        handleState(msg);
+      } else if (msg.type === 'chunks') {
+        handleChunks(msg);
+      }
+    };
+
+    ws.onclose = function() {
+      connected = false;
+      overlay.querySelector('span').textContent = 'Reconnecting...';
+      overlay.classList.remove('hidden');
+      setTimeout(connect, 2000);
+    };
+
+    ws.onerror = function() { ws.close(); };
+  }
+
+  function handleState(msg) {
+    prevPlayers = currPlayers;
+    currPlayers = {};
+    for (const p of msg.players) currPlayers[p.id] = p;
+    lastStateTime = performance.now();
+    survivors = msg.survivors || 0;
+    totalPlayers = msg.players.length;
+    if (msg.round) roundNum = msg.round;
+    if (msg.mode) gameMode = msg.mode;
+
+    if (msg.events) {
+      for (const ev of msg.events) {
+        if (ev.type === 'tag') {
+          shake = 10;
+          var isMe = ev.tagged_id === myId;
+          var text;
+          if (gameMode === 'infestation') {
+            text = isMe ? 'INFECTED!' : ev.tagged_name + ' infected!';
+          } else {
+            text = isMe ? "YOU'RE IT!" : ev.tagger_name + ' tagged ' + ev.tagged_name;
+          }
+          notifications.push({ text: text, time: 3.0, isMe: isMe });
+          if (ev.tagged_id === myId || ev.tagger_id === myId) ping = null;
+        } else if (ev.type === 'ping' && ev.player_id === myId) {
+          ping = { dx: ev.dx, dy: ev.dy, timer: 3.0 };
+        } else if (ev.type === 'round_end') {
+          var winMe = ev.winner_id === myId;
+          roundEnd = { winner: ev.winner_name, timer: 4.0, winMe: winMe };
+          shake = 15;
+        } else if (ev.type === 'round_start') {
+          roundEnd = null;
+          notifications.push({ text: 'Round ' + ev.round + ' — RUN!', time: 3.0, isMe: false });
+        } else if (ev.type === 'break') {
+          for (const d of ev.walls) {
+            var cxk = Math.floor(d[0] / 512);
+            var cyk = Math.floor(d[1] / 512);
+            var key = cxk + ',' + cyk;
+            if (chunks[key]) {
+              chunks[key] = chunks[key].filter(function(w) {
+                return !(w[0] === d[0] && w[1] === d[1]);
+              });
+            }
+          }
+          if (ev.player_id === myId) shake = 3;
+        }
+      }
+    }
+  }
+
+  function handleChunks(msg) {
+    for (const c of msg.chunks) {
+      chunks[c.cx + ',' + c.cy] = c.walls;
+    }
+  }
+
+  // ─── Input: Keyboard ───────────────────────────────────────────
+  document.addEventListener('keydown', function(e) {
+    keys[e.key] = true;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+    if (e.key === ' ' && !e.repeat) dashQueued = true;
+    if ((e.key === 'e' || e.key === 'E') && !e.repeat) breakQueued = true;
+  });
+  document.addEventListener('keyup', function(e) { keys[e.key] = false; });
+
+  // ─── Input: Touch ──────────────────────────────────────────────
+  if (isMobile) {
+    canvas.addEventListener('touchstart', function(e) {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (_inDashBtn(t.clientX, t.clientY)) {
+          dashQueued = true;
+          dashBtnTouched = true;
+          continue;
+        }
+        if (_inBreakBtn(t.clientX, t.clientY)) {
+          breakQueued = true;
+          breakBtnTouched = true;
+          continue;
+        }
+        if (t.clientX < canvas.width * 0.5 && !joystick.active) {
+          joystick.active = true;
+          joystick.id = t.identifier;
+          joystick.bx = t.clientX;
+          joystick.by = t.clientY;
+          joystick.tx = t.clientX;
+          joystick.ty = t.clientY;
+        }
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', function(e) {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const t = e.changedTouches[i];
+        if (t.identifier === joystick.id) {
+          joystick.tx = t.clientX;
+          joystick.ty = t.clientY;
+        }
+      }
+    }, { passive: false });
+
+    canvas.addEventListener('touchend', function(e) {
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier === joystick.id) {
+          joystick.active = false;
+          joystick.id = null;
+          inputDx = 0;
+          inputDy = 0;
+        }
+      }
+      dashBtnTouched = false;
+      breakBtnTouched = false;
+    });
+  }
+
+  function _inDashBtn(tx, ty) {
+    if (!isMobile) return false;
+    var bx = canvas.width - 80;
+    var by = canvas.height - 100;
+    var dx = tx - bx, dy = ty - by;
+    return Math.sqrt(dx * dx + dy * dy) < 50;
+  }
+
+  function _inBreakBtn(tx, ty) {
+    if (!isMobile) return false;
+    var bx = canvas.width - 80;
+    var by = canvas.height - 200;
+    var dx = tx - bx, dy = ty - by;
+    return Math.sqrt(dx * dx + dy * dy) < 50;
+  }
+
+  // ─── Input Send ────────────────────────────────────────────────
+  setInterval(function() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      var msg = { type: 'input', dx: +inputDx.toFixed(3), dy: +inputDy.toFixed(3) };
+      if (dashQueued) { msg.dash = true; dashQueued = false; }
+      if (breakQueued) { msg['break'] = true; breakQueued = false; }
+      ws.send(JSON.stringify(msg));
+    }
+  }, 50);
+
+  // ─── Update ────────────────────────────────────────────────────
+  function update(dt) {
+    if (!isMobile) {
+      inputDx = 0; inputDy = 0;
+      if (keys['w'] || keys['W'] || keys['ArrowUp'])    inputDy = -1;
+      if (keys['s'] || keys['S'] || keys['ArrowDown'])  inputDy = 1;
+      if (keys['a'] || keys['A'] || keys['ArrowLeft'])  inputDx = -1;
+      if (keys['d'] || keys['D'] || keys['ArrowRight']) inputDx = 1;
+      var mag = Math.sqrt(inputDx * inputDx + inputDy * inputDy);
+      if (mag > 1) { inputDx /= mag; inputDy /= mag; }
+    }
+
+    if (isMobile && joystick.active) {
+      var jdx = joystick.tx - joystick.bx;
+      var jdy = joystick.ty - joystick.by;
+      var jmag = Math.sqrt(jdx * jdx + jdy * jdy);
+      var maxR = 55;
+      if (jmag > 2) {
+        var clamped = Math.min(jmag, maxR);
+        inputDx = (jdx / jmag) * (clamped / maxR);
+        inputDy = (jdy / jmag) * (clamped / maxR);
+      } else {
+        inputDx = 0; inputDy = 0;
+      }
+    }
+
+    var me = currPlayers[myId];
+    if (me) {
+      var elapsed = (performance.now() - lastStateTime) / 1000;
+      var targetX = me.x + me.vx * elapsed;
+      var targetY = me.y + me.vy * elapsed;
+      camX += (targetX - camX) * 0.12;
+      camY += (targetY - camY) * 0.12;
+    }
+
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.life -= dt * 2.5;
+      p.x += p.vx;
+      p.y += p.vy;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    for (var i = notifications.length - 1; i >= 0; i--) {
+      notifications[i].time -= dt;
+      if (notifications[i].time <= 0) notifications.splice(i, 1);
+    }
+
+    if (shake > 0) shake *= 0.88;
+    if (shake < 0.3) shake = 0;
+
+    if (ping) {
+      ping.timer -= dt;
+      if (ping.timer <= 0) ping = null;
+    }
+    if (roundEnd) {
+      roundEnd.timer -= dt;
+      if (roundEnd.timer <= 0) roundEnd = null;
+    }
+  }
+
+  // ─── Render ────────────────────────────────────────────────────
+  function render() {
+    var W = canvas.width;
+    var H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#0a0e17';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    if (shake > 0) {
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    var elapsed = (performance.now() - lastStateTime) / 1000;
+
+    // Grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+    ctx.lineWidth = 1;
+    var startX = Math.floor((camX - W * 0.5) / TILE_SIZE) * TILE_SIZE;
+    var startY = Math.floor((camY - H * 0.5) / TILE_SIZE) * TILE_SIZE;
+    for (var gx = startX; gx < camX + W * 0.5; gx += TILE_SIZE) {
+      var sx = gx - camX + W * 0.5;
+      ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, H); ctx.stroke();
+    }
+    for (var gy = startY; gy < camY + H * 0.5; gy += TILE_SIZE) {
+      var sy = gy - camY + H * 0.5;
+      ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(W, sy); ctx.stroke();
+    }
+
+    // Walls
+    var viewL = camX - W * 0.5 - TILE_SIZE;
+    var viewR = camX + W * 0.5 + TILE_SIZE;
+    var viewT = camY - H * 0.5 - TILE_SIZE;
+    var viewB = camY + H * 0.5 + TILE_SIZE;
+
+    for (var key in chunks) {
+      var walls = chunks[key];
+      for (var i = 0; i < walls.length; i++) {
+        var w = walls[i];
+        var wx = w[0], wy = w[1], ww = w[2], wh = w[3];
+        if (wx + ww < viewL || wx > viewR || wy + wh < viewT || wy > viewB) continue;
+        var sp = worldToScreen(wx, wy);
+        ctx.fillStyle = '#1a2235';
+        ctx.fillRect(sp[0], sp[1], ww, wh);
+        ctx.strokeStyle = '#2a3555';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sp[0], sp[1], ww, wh);
+      }
+    }
+
+    // Particles
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var sp = worldToScreen(p.x, p.y);
+      ctx.globalAlpha = p.life * 0.6;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(sp[0], sp[1], (p.size || 3) * p.life, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Players
+    var itPlayer = null;
+    for (var id in currPlayers) {
+      if (currPlayers[id].is_it) { itPlayer = currPlayers[id]; break; }
+    }
+
+    for (var id in currPlayers) {
+      var curr = currPlayers[id];
+      var prev = prevPlayers[id];
+      var rx, ry;
+      if (prev) {
+        var t = Math.min((performance.now() - lastStateTime) / 55, 1.2);
+        rx = prev.x + (curr.x - prev.x) * t;
+        ry = prev.y + (curr.y - prev.y) * t;
+      } else {
+        rx = curr.x + curr.vx * elapsed;
+        ry = curr.y + curr.vy * elapsed;
+      }
+
+      var sp = worldToScreen(rx, ry);
+      var color = playerColor(id, curr.is_it);
+
+      // Danger glow
+      if (!curr.is_it && itPlayer) {
+        var dd = Math.hypot(rx - (itPlayer.x + itPlayer.vx * elapsed), ry - (itPlayer.y + itPlayer.vy * elapsed));
+        if (dd < 180) {
+          ctx.shadowColor = 'rgba(255,0,0,' + ((1 - dd / 180) * 0.4).toFixed(2) + ')';
+          ctx.shadowBlur = 18 * (1 - dd / 180);
+        }
+      }
+
+      if (curr.is_it) {
+        var pulse = 0.6 + 0.4 * Math.sin(performance.now() * 0.005);
+        ctx.shadowColor = 'rgba(255,60,60,' + pulse.toFixed(2) + ')';
+        ctx.shadowBlur = 20 + 8 * pulse;
+      }
+
+      // Dash visual: stretched circle + bright glow
+      var drawR = PLAYER_R;
+      if (curr.dashing) {
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 30;
+        drawR = PLAYER_R * 1.3;
+        // Dash burst particles
+        if (particles.length < MAX_PARTICLES) {
+          for (var di = 0; di < 4; di++) {
+            particles.push({
+              x: rx + (Math.random() - 0.5) * 10,
+              y: ry + (Math.random() - 0.5) * 10,
+              vx: -curr.vx * 0.08 + (Math.random() - 0.5) * 1.5,
+              vy: -curr.vy * 0.08 + (Math.random() - 0.5) * 1.5,
+              life: 1.0,
+              color: '#fff',
+              size: 4,
+            });
+          }
+        }
+      }
+
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(sp[0], sp[1], drawR, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (id === myId) {
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2.5;
+        ctx.stroke();
+      }
+
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+
+      ctx.fillStyle = '#ddd';
+      ctx.font = '11px "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(curr.name, sp[0], sp[1] - drawR - 8);
+
+      if (curr.is_bot) {
+        ctx.fillStyle = '#666';
+        ctx.font = '9px "Segoe UI", sans-serif';
+        ctx.fillText('BOT', sp[0], sp[1] - drawR - 19);
+      }
+
+      var speed = Math.sqrt(curr.vx * curr.vx + curr.vy * curr.vy);
+      if (speed > 2 && particles.length < MAX_PARTICLES && Math.random() < 0.4) {
+        particles.push({
+          x: rx + (Math.random() - 0.5) * 6,
+          y: ry + (Math.random() - 0.5) * 6,
+          vx: -curr.vx * 0.05 + (Math.random() - 0.5) * 0.3,
+          vy: -curr.vy * 0.05 + (Math.random() - 0.5) * 0.3,
+          life: 1.0,
+          color: color,
+          size: 3,
+        });
+      }
+    }
+
+    ctx.restore();
+
+    // ── HUD ──
+    ctx.save();
+    ctx.font = '14px "Segoe UI", sans-serif';
+    var me = currPlayers[myId];
+
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.textAlign = 'right';
+    if (roomId) {
+      ctx.fillStyle = 'rgba(255,255,255,0.2)';
+      ctx.font = '10px "Segoe UI", sans-serif';
+      ctx.fillText('room ' + roomId, W - 16, 44);
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '14px "Segoe UI", sans-serif';
+    }
+    if (gameMode === 'infestation') {
+      ctx.fillText('Round ' + roundNum + '  ·  ' + totalPlayers + ' players', W - 16, 28);
+      // Survivor counter
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#44cc88';
+      ctx.font = 'bold 14px "Segoe UI", sans-serif';
+      ctx.fillText('Survivors: ' + survivors + ' / ' + totalPlayers, 16, 28);
+    } else {
+      ctx.fillText(totalPlayers + ' players', W - 16, 28);
+    }
+
+    if (me) {
+      ctx.textAlign = 'center';
+      if (gameMode === 'infestation') {
+        if (me.is_it) {
+          ctx.fillStyle = '#ff4444';
+          ctx.font = 'bold 16px "Segoe UI", sans-serif';
+          ctx.fillText('INFECTED — Spread it!', W * 0.5, 30);
+        } else {
+          ctx.fillStyle = '#44cc88';
+          ctx.font = 'bold 16px "Segoe UI", sans-serif';
+          ctx.fillText('SURVIVE!', W * 0.5, 30);
+        }
+      } else {
+        if (me.is_it) {
+          ctx.fillStyle = '#ff4444';
+          ctx.font = 'bold 16px "Segoe UI", sans-serif';
+          ctx.fillText("YOU'RE IT! Chase them!", W * 0.5, 30);
+        } else if (itPlayer) {
+          ctx.fillStyle = '#44cc88';
+          ctx.font = '14px "Segoe UI", sans-serif';
+          ctx.fillText('Run from ' + itPlayer.name + '!', W * 0.5, 30);
+        }
+      }
+    }
+
+    // Round end overlay (infestation)
+    if (roundEnd) {
+      var alpha = Math.min(1, roundEnd.timer / 0.5);
+      ctx.globalAlpha = alpha * 0.7;
+      ctx.fillStyle = '#0a0e17';
+      ctx.fillRect(0, H * 0.3, W, H * 0.25);
+      ctx.globalAlpha = alpha;
+      ctx.textAlign = 'center';
+      if (roundEnd.winMe) {
+        ctx.fillStyle = '#ffd700';
+        ctx.font = 'bold 36px "Segoe UI", sans-serif';
+        ctx.fillText('YOU SURVIVED!', W * 0.5, H * 0.42);
+      } else if (roundEnd.winner && roundEnd.winner !== 'Nobody') {
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 30px "Segoe UI", sans-serif';
+        ctx.fillText('Last Survivor: ' + roundEnd.winner, W * 0.5, H * 0.42);
+      } else {
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 30px "Segoe UI", sans-serif';
+        ctx.fillText('Total Infestation!', W * 0.5, H * 0.42);
+      }
+      ctx.fillStyle = '#888';
+      ctx.font = '14px "Segoe UI", sans-serif';
+      ctx.fillText('Next round starting...', W * 0.5, H * 0.48);
+      ctx.globalAlpha = 1;
+    }
+
+    // Dash cooldown (desktop HUD)
+    if (me && !isMobile) {
+      var dashCd = me.dash_cd || 0;
+      var dashReady = dashCd <= 0;
+      var hudX = W - 80;
+      var hudY = H - 50;
+
+      ctx.beginPath();
+      ctx.arc(hudX, hudY, 18, 0, Math.PI * 2);
+      ctx.fillStyle = dashReady ? 'rgba(0,255,150,0.15)' : 'rgba(255,255,255,0.05)';
+      ctx.fill();
+
+      if (!dashReady) {
+        var pct = 1 - dashCd / 3.5;
+        ctx.beginPath();
+        ctx.moveTo(hudX, hudY);
+        ctx.arc(hudX, hudY, 18, -Math.PI * 0.5, -Math.PI * 0.5 + Math.PI * 2 * pct);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(0,255,150,0.2)';
+        ctx.fill();
+      }
+
+      ctx.strokeStyle = dashReady ? '#00ff96' : '#445';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(hudX, hudY, 18, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = dashReady ? '#00ff96' : '#667';
+      ctx.font = 'bold 10px "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('DASH', hudX, hudY + 4);
+
+      // Break cooldown (desktop)
+      var breakCd = me.break_cd || 0;
+      var breakReady = breakCd <= 0;
+      var bhX = hudX - 50;
+      var bhY = hudY;
+
+      ctx.beginPath();
+      ctx.arc(bhX, bhY, 18, 0, Math.PI * 2);
+      ctx.fillStyle = breakReady ? 'rgba(255,170,50,0.15)' : 'rgba(255,255,255,0.05)';
+      ctx.fill();
+
+      if (!breakReady) {
+        var bpct = 1 - breakCd / 1.0;
+        ctx.beginPath();
+        ctx.moveTo(bhX, bhY);
+        ctx.arc(bhX, bhY, 18, -Math.PI * 0.5, -Math.PI * 0.5 + Math.PI * 2 * bpct);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(255,170,50,0.2)';
+        ctx.fill();
+      }
+
+      ctx.strokeStyle = breakReady ? '#ffaa32' : '#445';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(bhX, bhY, 18, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = breakReady ? '#ffaa32' : '#667';
+      ctx.font = 'bold 9px "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('BREAK', bhX, bhY + 4);
+    }
+
+    // Notifications
+    for (var i = 0; i < notifications.length; i++) {
+      var n = notifications[i];
+      var alpha = Math.min(1, n.time);
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = n.isMe ? '#ff4444' : '#fff';
+      ctx.font = (n.isMe ? 'bold 28px' : '16px') + ' "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(n.text, W * 0.5, H * 0.35 + i * 36);
+    }
+    ctx.globalAlpha = 1;
+
+    // Radar ping indicator
+    if (ping) {
+      var blink = 0.4 + 0.6 * Math.abs(Math.sin(performance.now() * 0.006));
+      var fadeOut = Math.min(1, ping.timer / 0.5);
+      ctx.globalAlpha = blink * fadeOut;
+
+      var angle = Math.atan2(ping.dy, ping.dx);
+      var margin = 60;
+      var cx = W * 0.5 + Math.cos(angle) * (W * 0.5 - margin);
+      var cy = H * 0.5 + Math.sin(angle) * (H * 0.5 - margin);
+      cx = Math.max(margin, Math.min(W - margin, cx));
+      cy = Math.max(margin, Math.min(H - margin, cy));
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(angle);
+
+      // Sonar ring
+      var ringR = 18 + 12 * (1 - (ping.timer % 1));
+      var ringAlpha = (ping.timer % 1);
+      ctx.beginPath();
+      ctx.arc(0, 0, ringR, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,100,100,' + (ringAlpha * 0.4).toFixed(2) + ')';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Arrow chevron
+      ctx.beginPath();
+      ctx.moveTo(14, 0);
+      ctx.lineTo(-6, -9);
+      ctx.lineTo(-2, 0);
+      ctx.lineTo(-6, 9);
+      ctx.closePath();
+      ctx.fillStyle = '#ff4444';
+      ctx.fill();
+
+      // Outer glow
+      ctx.shadowColor = '#ff4444';
+      ctx.shadowBlur = 15;
+      ctx.beginPath();
+      ctx.arc(0, 0, 4, 0, Math.PI * 2);
+      ctx.fillStyle = '#ff6666';
+      ctx.fill();
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+
+      ctx.restore();
+      ctx.globalAlpha = 1;
+    }
+
+    if (!isMobile && !me) {
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.font = '13px "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('WASD to move · SPACE dash · E break', W * 0.5, H - 20);
+    }
+    ctx.restore();
+
+    // ── Mobile Controls ──
+    if (isMobile) {
+      // Joystick
+      if (joystick.active) {
+        var maxR = 55;
+        ctx.beginPath();
+        ctx.arc(joystick.bx, joystick.by, maxR, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        var tdx = joystick.tx - joystick.bx;
+        var tdy = joystick.ty - joystick.by;
+        var tmag = Math.sqrt(tdx * tdx + tdy * tdy);
+        if (tmag > maxR) { tdx = tdx / tmag * maxR; tdy = tdy / tmag * maxR; }
+        ctx.beginPath();
+        ctx.arc(joystick.bx + tdx, joystick.by + tdy, 22, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.3)';
+        ctx.fill();
+      } else {
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        ctx.font = '12px "Segoe UI", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Touch left side to move', canvas.width * 0.25, canvas.height - 30);
+      }
+
+      // Dash button
+      var dbx = canvas.width - 80;
+      var dby = canvas.height - 100;
+      var dashCdM = me ? (me.dash_cd || 0) : 0;
+      var dashReadyM = dashCdM <= 0;
+
+      ctx.beginPath();
+      ctx.arc(dbx, dby, 38, 0, Math.PI * 2);
+      ctx.fillStyle = dashBtnTouched ? 'rgba(0,255,150,0.3)' : (dashReadyM ? 'rgba(0,255,150,0.12)' : 'rgba(255,255,255,0.05)');
+      ctx.fill();
+
+      if (!dashReadyM) {
+        var pctM = 1 - dashCdM / 3.5;
+        ctx.beginPath();
+        ctx.moveTo(dbx, dby);
+        ctx.arc(dbx, dby, 38, -Math.PI * 0.5, -Math.PI * 0.5 + Math.PI * 2 * pctM);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(0,255,150,0.15)';
+        ctx.fill();
+      }
+
+      ctx.strokeStyle = dashReadyM ? '#00ff96' : '#445';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(dbx, dby, 38, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = dashReadyM ? '#00ff96' : '#667';
+      ctx.font = 'bold 14px "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('DASH', dbx, dby + 5);
+
+      // Break button (mobile)
+      var bbx = canvas.width - 80;
+      var bby = canvas.height - 200;
+      var breakCdM = me ? (me.break_cd || 0) : 0;
+      var breakReadyM = breakCdM <= 0;
+
+      ctx.beginPath();
+      ctx.arc(bbx, bby, 38, 0, Math.PI * 2);
+      ctx.fillStyle = breakBtnTouched ? 'rgba(255,170,50,0.3)' : (breakReadyM ? 'rgba(255,170,50,0.12)' : 'rgba(255,255,255,0.05)');
+      ctx.fill();
+
+      if (!breakReadyM) {
+        var bpctM = 1 - breakCdM / 1.0;
+        ctx.beginPath();
+        ctx.moveTo(bbx, bby);
+        ctx.arc(bbx, bby, 38, -Math.PI * 0.5, -Math.PI * 0.5 + Math.PI * 2 * bpctM);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(255,170,50,0.15)';
+        ctx.fill();
+      }
+
+      ctx.strokeStyle = breakReadyM ? '#ffaa32' : '#445';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(bbx, bby, 38, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = breakReadyM ? '#ffaa32' : '#667';
+      ctx.font = 'bold 13px "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('BREAK', bbx, bby + 5);
+    }
+  }
+
+  // ─── Main Loop ─────────────────────────────────────────────────
+  var lastTime = 0;
+  function loop(timestamp) {
+    var dt = Math.min((timestamp - lastTime) / 1000, 0.1);
+    lastTime = timestamp;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  connect();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
