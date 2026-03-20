@@ -183,7 +183,7 @@ elif st.session_state.page == "game":
     if WS_EXTERNAL_URL:
         ws_url = WS_EXTERNAL_URL
     else:
-        ws_url = f"ws://{get_local_ip()}:{SERVER_PORT}"
+        ws_url = f"ws://{get_local_ip()}:{SERVER_PORT}/ws"
 
     html = html.replace("__PLAYER_NAME__", player_name.replace('"', '\\"'))
     html = html.replace("__WS_URL__", ws_url)

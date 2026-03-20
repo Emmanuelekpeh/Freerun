@@ -1,5 +1,4 @@
 import asyncio
-import http
 import json
 import os
 import random
@@ -7,7 +6,8 @@ import time
 import urllib.parse
 import uuid
 
-import websockets
+from aiohttp import web
+import aiohttp
 
 from engine import GameEngine, TICK_RATE, TICK_DT
 from bots import ScriptedBot, RLBot
@@ -147,15 +147,15 @@ class GameRoom:
         for ws, pid in list(self.clients.items()):
             async def _send(ws=ws, pid=pid):
                 try:
-                    await ws.send(state_json)
+                    await ws.send_str(state_json)
                     if send_chunks:
                         player = self.engine.players.get(pid)
                         if player:
                             cdata = json.dumps(
                                 self.engine.get_chunks_data(player.x, player.y, radius=2)
                             )
-                            await ws.send(cdata)
-                except websockets.exceptions.ConnectionClosed:
+                            await ws.send_str(cdata)
+                except Exception:
                     pass
             tasks.append(_send())
 
@@ -209,74 +209,8 @@ class GameServer:
         self.manager = RoomManager()
         self.client_rooms: dict = {}
 
-    async def handle_client(self, ws):
-        player_id = None
-        room = None
-        try:
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
 
-                if msg.get("type") == "join" and room is None:
-                    name = str(msg.get("name", "Player"))[:16]
-                    req_mode = str(msg.get("mode", "classic"))
-                    if req_mode not in ("classic", "infestation"):
-                        req_mode = "classic"
-
-                    room = self.manager.find_or_create(req_mode)
-                    player_id = uuid.uuid4().hex[:8]
-                    player = room.add_human(ws, player_id, name)
-                    self.client_rooms[ws] = room
-
-                    await ws.send(json.dumps({
-                        "type": "welcome",
-                        "id": player_id,
-                        "seed": room.engine.seed,
-                        "mode": room.mode,
-                        "room": room.id,
-                    }))
-                    chunks = room.engine.get_chunks_data(player.x, player.y, radius=2)
-                    await ws.send(json.dumps(chunks))
-
-                elif msg.get("type") == "input" and player_id and room:
-                    dx = float(msg.get("dx", 0))
-                    dy = float(msg.get("dy", 0))
-                    room.engine.set_input(player_id, dx, dy)
-                    if msg.get("dash"):
-                        room.engine.trigger_dash(player_id)
-                    if msg.get("break"):
-                        room.engine.trigger_break(player_id)
-
-        except websockets.exceptions.ConnectionClosed:
-            pass
-        finally:
-            if room:
-                room.remove_human(ws)
-            if ws in self.client_rooms:
-                del self.client_rooms[ws]
-
-    async def game_loop(self):
-        cleanup_counter = 0
-        while True:
-            start = time.monotonic()
-
-            for room in list(self.manager.rooms.values()):
-                await room.tick_and_broadcast()
-
-            cleanup_counter += 1
-            if cleanup_counter >= TICK_RATE * 5:
-                self.manager.cleanup()
-                cleanup_counter = 0
-
-            elapsed = time.monotonic() - start
-            sleep_time = TICK_DT - elapsed
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-
-
-# ─── Built-in HTTP serving (for Render / standalone) ─────────────────
+# ─── Built-in HTTP + WebSocket serving (aiohttp) ─────────────────────
 
 _LOBBY_HTML = """<!DOCTYPE html>
 <html lang="en"><head>
@@ -327,45 +261,120 @@ def _build_game_html(name, mode, ws_url):
     return html
 
 
-async def _http_handler(path, request_headers):
-    if path == "/" or path == "":
-        return http.HTTPStatus.OK, [("Content-Type", "text/html")], _LOBBY_HTML.encode()
-
-    if path.startswith("/play"):
-        parsed = urllib.parse.urlparse(path)
-        params = urllib.parse.parse_qs(parsed.query)
-        name = params.get("name", ["Player"])[0][:16]
-        mode = params.get("mode", ["classic"])[0]
-        if mode not in ("classic", "infestation"):
-            mode = "classic"
-
-        host_header = None
-        for h_name, h_val in request_headers.raw_items():
-            if h_name.lower() == "host":
-                host_header = h_val
-                break
-
-        if host_header:
-            proto = "wss" if "onrender.com" in host_header or "https" in str(request_headers) else "ws"
-            ws_url = f"{proto}://{host_header}"
-        else:
-            ws_url = f"ws://localhost:{PORT}"
-
-        html = _build_game_html(name, mode, ws_url)
-        return http.HTTPStatus.OK, [("Content-Type", "text/html")], html.encode()
-
-    return http.HTTPStatus.NOT_FOUND, [], b"Not Found"
+def _ws_url_from_request(request):
+    host = request.headers.get("Host", f"localhost:{PORT}")
+    if "onrender.com" in host or request.scheme == "https":
+        return f"wss://{host}/ws"
+    return f"ws://{host}/ws"
 
 
-async def main():
-    server = GameServer()
-    async with websockets.serve(
-        server.handle_client, HOST, PORT,
-        process_request=_http_handler,
-    ):
-        print(f"Freerun server running on http://{HOST}:{PORT}")
-        await server.game_loop()
+_game_server = GameServer()
+
+
+async def handle_lobby(request):
+    return web.Response(text=_LOBBY_HTML, content_type="text/html")
+
+
+async def handle_play(request):
+    name = request.query.get("name", "Player")[:16]
+    mode = request.query.get("mode", "classic")
+    if mode not in ("classic", "infestation"):
+        mode = "classic"
+    ws_url = _ws_url_from_request(request)
+    html = _build_game_html(name, mode, ws_url)
+    return web.Response(text=html, content_type="text/html")
+
+
+async def handle_ws(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    player_id = None
+    room = None
+    try:
+        async for raw in ws:
+            if raw.type != aiohttp.WSMsgType.TEXT:
+                continue
+            try:
+                msg = json.loads(raw.data)
+            except json.JSONDecodeError:
+                continue
+
+            if msg.get("type") == "join" and room is None:
+                name = str(msg.get("name", "Player"))[:16]
+                req_mode = str(msg.get("mode", "classic"))
+                if req_mode not in ("classic", "infestation"):
+                    req_mode = "classic"
+
+                room = _game_server.manager.find_or_create(req_mode)
+                player_id = uuid.uuid4().hex[:8]
+                player = room.add_human(ws, player_id, name)
+                _game_server.client_rooms[ws] = room
+
+                await ws.send_str(json.dumps({
+                    "type": "welcome",
+                    "id": player_id,
+                    "seed": room.engine.seed,
+                    "mode": room.mode,
+                    "room": room.id,
+                }))
+                chunks = room.engine.get_chunks_data(player.x, player.y, radius=2)
+                await ws.send_str(json.dumps(chunks))
+
+            elif msg.get("type") == "input" and player_id and room:
+                dx = float(msg.get("dx", 0))
+                dy = float(msg.get("dy", 0))
+                room.engine.set_input(player_id, dx, dy)
+                if msg.get("dash"):
+                    room.engine.trigger_dash(player_id)
+                if msg.get("break"):
+                    room.engine.trigger_break(player_id)
+    finally:
+        if room:
+            room.remove_human(ws)
+        if ws in _game_server.client_rooms:
+            del _game_server.client_rooms[ws]
+
+    return ws
+
+
+async def game_loop_task(app):
+    async def _loop():
+        cleanup_counter = 0
+        while True:
+            start = time.monotonic()
+            for room in list(_game_server.manager.rooms.values()):
+                await room.tick_and_broadcast()
+            cleanup_counter += 1
+            if cleanup_counter >= TICK_RATE * 5:
+                _game_server.manager.cleanup()
+                cleanup_counter = 0
+            elapsed = time.monotonic() - start
+            sleep_time = TICK_DT - elapsed
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+
+    app["game_loop"] = asyncio.create_task(_loop())
+
+
+async def cleanup_game_loop(app):
+    app["game_loop"].cancel()
+    try:
+        await app["game_loop"]
+    except asyncio.CancelledError:
+        pass
+
+
+def main():
+    app = web.Application()
+    app.router.add_get("/", handle_lobby)
+    app.router.add_get("/play", handle_play)
+    app.router.add_get("/ws", handle_ws)
+    app.on_startup.append(game_loop_task)
+    app.on_cleanup.append(cleanup_game_loop)
+    print(f"Freerun server starting on http://{HOST}:{PORT}")
+    web.run_app(app, host=HOST, port=PORT, print=None)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
