@@ -11,7 +11,7 @@ import aiohttp
 
 from engine import GameEngine, TICK_RATE, TICK_DT
 from bots import HybridBot
-from brain import BotBrain
+from brain import PopulationManager
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8765))
@@ -43,12 +43,11 @@ PSYCHOLOGIST_NAMES = [
     "Tolman", "Guthrie", "Rescorla", "Garcia", "Bolles",
 ]
 
-
-_shared_brain = BotBrain.shared()
-
+_pop_manager = PopulationManager(pool_size=10)
 
 def _make_bot_brain():
-    return HybridBot(brain=_shared_brain)
+    brain = _pop_manager.get_random_brain()
+    return HybridBot(brain=brain)
 
 
 # ─── Game Room ────────────────────────────────────────────────────────
@@ -361,7 +360,7 @@ async def cleanup_game_loop(app):
         await app["game_loop"]
     except asyncio.CancelledError:
         pass
-    _shared_brain.save()
+    _pop_manager.stop()
 
 
 def main():

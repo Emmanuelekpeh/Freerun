@@ -395,13 +395,13 @@ class HybridBot:
 
     The blend starts heavily scripted (alpha=0.8) and gradually shifts
     toward the learned policy as training accumulates. Every tick, the
-    bot records (obs, action, reward) into the shared BotBrain's replay
-    buffer. Training happens automatically every N ticks.
+    bot records (obs, action, reward) into its assigned BotBrain's replay
+    buffer. Training happens automatically in a background thread.
     """
 
-    def __init__(self, brain: BotBrain = None, personality: str = None):
+    def __init__(self, brain: BotBrain, personality: str = None):
         self.scripted = ScriptedBot(personality=personality)
-        self.brain = brain or BotBrain.shared()
+        self.brain = brain
         self._prev_obs: dict = None
         self._prev_obs_vec: np.ndarray = None
         self._prev_action: np.ndarray = None
@@ -432,8 +432,6 @@ class HybridBot:
             1.0 if final_dash else 0.0,
             1.0 if final_break else 0.0,
         ], dtype=np.float32)
-
-        self.brain.maybe_train()
 
         return final_dx, final_dy, final_dash, final_break
 

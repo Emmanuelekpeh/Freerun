@@ -496,6 +496,21 @@ class GameEngine:
                 p.vx -= (p.x / dist_from_origin) * pull
                 p.vy -= (p.y / dist_from_origin) * pull
 
+        # ── Soft Convergence (Gravity Zones) ──
+        # Gently pull players toward the center of mass to encourage interaction
+        if len(self.players) > 1:
+            cx = sum(p.x for p in self.players.values()) / len(self.players)
+            cy = sum(p.y for p in self.players.values()) / len(self.players)
+            for p in self.players.values():
+                dx = cx - p.x
+                dy = cy - p.y
+                dist = math.sqrt(dx * dx + dy * dy)
+                if dist > 400:  # Only pull if they are far from the action
+                    pull_strength = 0.008  # Very subtle gravity
+                    p.vx += (dx / dist) * pull_strength
+                    p.vy += (dy / dist) * pull_strength
+
+        for p in self.players.values():
             self._resolve_wall_collisions(p)
 
             sx = int(math.floor(p.x / SECTOR_SIZE))

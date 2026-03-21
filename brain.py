@@ -6,8 +6,11 @@ Shared singleton across all game rooms so every public match
 feeds experience into the same evolving policy.
 """
 
+import copy
 import math
 import os
+import threading
+import time
 import numpy as np
 
 WEIGHTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
@@ -155,34 +158,19 @@ def encode_obs(obs: dict) -> np.ndarray:
     return v
 
 
-# ─── Bot Brain (singleton) ───────────────────────────────────────────
+# ─── Bot Brain ───────────────────────────────────────────────────────
 
 class BotBrain:
-    """Shared learning brain for all hybrid bots on the server."""
+    """Individual learning brain for hybrid bots."""
 
-    _instance = None
-
-    @classmethod
-    def shared(cls) -> "BotBrain":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def __init__(self):
+    def __init__(self, brain_id: str = None):
+        self.id = brain_id or os.urandom(4).hex()
         self.net = NumpyNet()
         self.buffer = ReplayBuffer()
         self.train_steps = 0
         self.tick_counter = 0
-
-        os.makedirs(WEIGHTS_DIR, exist_ok=True)
-        if os.path.exists(WEIGHTS_FILE):
-            try:
-                self.net.load(WEIGHTS_FILE)
-                if os.path.exists(META_FILE):
-                    m = np.load(META_FILE)
-                    self.train_steps = int(m["train_steps"])
-            except Exception:
-                pass
+        self.fitness = 0.0
+        self.lock = threading.Lock()
 
     @property
     def alpha(self) -> float:
@@ -192,7 +180,8 @@ class BotBrain:
 
     def get_action(self, obs_vec: np.ndarray):
         """Returns (dx, dy, dash_prob, break_prob)."""
-        raw = self.net.forward(obs_vec.reshape(1, -1))[0]
+        with self.lock:
+            raw = self.net.forward(obs_vec.reshape(1, -1))[0]
         dx = float(np.tanh(raw[0]))
         dy = float(np.tanh(raw[1]))
         dash_p = float(1.0 / (1.0 + math.exp(-max(-10, min(10, raw[2])))))
@@ -202,49 +191,149 @@ class BotBrain:
     # ── Experience collection ──────────────────────────────────────
 
     def record(self, obs_vec: np.ndarray, act_vec: np.ndarray, reward: float):
-        self.buffer.add(obs_vec, act_vec, reward)
+        with self.lock:
+            self.buffer.add(obs_vec, act_vec, reward)
+            # Simple exponential moving average for fitness
+            self.fitness = 0.99 * self.fitness + 0.01 * reward
 
     # ── Training step ──────────────────────────────────────────────
 
-    def maybe_train(self):
-        self.tick_counter += 1
-        if self.tick_counter % TRAIN_EVERY != 0:
-            return
-        if self.buffer.size < BATCH_SIZE * 2:
-            return
+    def train_step(self):
+        with self.lock:
+            if self.buffer.size < BATCH_SIZE * 2:
+                return
 
-        obs_b, act_b, rew_b = self.buffer.sample(BATCH_SIZE)
+            obs_b, act_b, rew_b = self.buffer.sample(BATCH_SIZE)
 
-        mean_r = rew_b.mean()
-        std_r  = rew_b.std() + 1e-8
-        advantages = (rew_b - mean_r) / std_r
-        weights = np.maximum(advantages, 0).reshape(-1, 1)
+            mean_r = rew_b.mean()
+            std_r  = rew_b.std() + 1e-8
+            advantages = (rew_b - mean_r) / std_r
+            weights = np.maximum(advantages, 0).reshape(-1, 1)
 
-        raw = self.net.forward(obs_b)
-        pred_move = np.tanh(raw[:, :2])
-        sig_raw = np.clip(raw[:, 2:], -10, 10)
-        pred_db = 1.0 / (1.0 + np.exp(-sig_raw))
-        pred = np.concatenate([pred_move, pred_db], axis=1)
+            raw = self.net.forward(obs_b)
+            pred_move = np.tanh(raw[:, :2])
+            sig_raw = np.clip(raw[:, 2:], -10, 10)
+            pred_db = 1.0 / (1.0 + np.exp(-sig_raw))
+            pred = np.concatenate([pred_move, pred_db], axis=1)
 
-        errors = pred - act_b
-        d_full = 2.0 * errors * weights
+            errors = pred - act_b
+            d_full = 2.0 * errors * weights
 
-        dtanh = (1.0 - pred_move ** 2).astype(np.float32)
-        dsig  = (pred_db * (1.0 - pred_db)).astype(np.float32)
-        d_out = np.concatenate([d_full[:, :2] * dtanh,
-                                d_full[:, 2:] * dsig], axis=1)
+            dtanh = (1.0 - pred_move ** 2).astype(np.float32)
+            dsig  = (pred_db * (1.0 - pred_db)).astype(np.float32)
+            d_out = np.concatenate([d_full[:, :2] * dtanh,
+                                    d_full[:, 2:] * dsig], axis=1)
 
-        self.net.backward(d_out, LEARNING_RATE)
-        self.train_steps += 1
-
-        if self.train_steps % SAVE_EVERY == 0:
-            self.save()
+            self.net.backward(d_out, LEARNING_RATE)
+            self.train_steps += 1
 
     # ── Persistence ────────────────────────────────────────────────
 
-    def save(self):
-        try:
-            self.net.save(WEIGHTS_FILE)
-            np.savez_compressed(META_FILE, train_steps=np.array(self.train_steps))
-        except Exception:
-            pass
+    def save(self, path: str):
+        with self.lock:
+            self.net.save(path)
+            meta_path = path.replace(".npz", "_meta.npz")
+            np.savez_compressed(meta_path, train_steps=np.array(self.train_steps), fitness=np.array(self.fitness))
+
+    def load(self, path: str):
+        with self.lock:
+            self.net.load(path)
+            meta_path = path.replace(".npz", "_meta.npz")
+            if os.path.exists(meta_path):
+                m = np.load(meta_path)
+                self.train_steps = int(m["train_steps"])
+                self.fitness = float(m.get("fitness", 0.0))
+
+    def clone(self) -> "BotBrain":
+        with self.lock:
+            new_brain = BotBrain()
+            new_brain.net.W1 = self.net.W1.copy()
+            new_brain.net.b1 = self.net.b1.copy()
+            new_brain.net.W2 = self.net.W2.copy()
+            new_brain.net.b2 = self.net.b2.copy()
+            new_brain.net.W3 = self.net.W3.copy()
+            new_brain.net.b3 = self.net.b3.copy()
+            new_brain.train_steps = self.train_steps
+            new_brain.fitness = self.fitness
+            return new_brain
+
+    def mutate(self, mutation_rate: float = 0.05):
+        with self.lock:
+            for w in (self.net.W1, self.net.b1, self.net.W2, self.net.b2, self.net.W3, self.net.b3):
+                noise = np.random.randn(*w.shape).astype(np.float32) * mutation_rate
+                w += noise
+
+
+# ─── Population Manager ──────────────────────────────────────────────
+
+class PopulationManager:
+    """Manages a pool of BotBrains and trains them in a background thread."""
+
+    def __init__(self, pool_size: int = 10):
+        self.pool_size = pool_size
+        self.brains = [BotBrain() for _ in range(pool_size)]
+        self.running = True
+        
+        self.load_population()
+        
+        self.thread = threading.Thread(target=self._training_loop, daemon=True)
+        self.thread.start()
+
+    def get_random_brain(self) -> BotBrain:
+        return np.random.choice(self.brains)
+
+    def load_population(self):
+        os.makedirs(WEIGHTS_DIR, exist_ok=True)
+        for i, brain in enumerate(self.brains):
+            path = os.path.join(WEIGHTS_DIR, f"brain_{i}.npz")
+            if os.path.exists(path):
+                try:
+                    brain.load(path)
+                except Exception as e:
+                    print(f"[PopulationManager] Failed to load {path}: {e}")
+
+    def save_population(self):
+        os.makedirs(WEIGHTS_DIR, exist_ok=True)
+        for i, brain in enumerate(self.brains):
+            path = os.path.join(WEIGHTS_DIR, f"brain_{i}.npz")
+            try:
+                brain.save(path)
+            except Exception as e:
+                print(f"[PopulationManager] Failed to save {path}: {e}")
+
+    def _training_loop(self):
+        loops = 0
+        while self.running:
+            try:
+                for brain in self.brains:
+                    brain.train_step()
+                
+                loops += 1
+                # Evolve population every ~1000 loops
+                if loops % 1000 == 0:
+                    self._evolve_population()
+            except Exception as e:
+                print(f"[PopulationManager] Training error: {e}")
+                
+            time.sleep(0.05)  # Yield to prevent high CPU usage
+
+    def _evolve_population(self):
+        # Sort brains by fitness
+        self.brains.sort(key=lambda b: b.fitness, reverse=True)
+        
+        best_fitness = self.brains[0].fitness
+        avg_alpha = sum(b.alpha for b in self.brains) / self.pool_size
+        print(f"[PopulationManager] Evolving. Best fitness: {best_fitness:.3f}, Avg Alpha: {avg_alpha:.3f}")
+        
+        # Keep top 50%, replace bottom 50% with mutated clones of top 50%
+        half = self.pool_size // 2
+        for i in range(half, self.pool_size):
+            parent = self.brains[i - half]
+            child = parent.clone()
+            child.mutate()
+            self.brains[i] = child
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+        self.save_population()
