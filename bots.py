@@ -419,11 +419,23 @@ class HybridBot:
         s_dx, s_dy, s_dash, s_break = self.scripted.get_action(observation)
         l_dx, l_dy, dash_p, brk_p = self.brain.get_action(obs_vec)
 
-        a = self.brain.alpha
-        final_dx = a * s_dx + (1.0 - a) * l_dx
-        final_dy = a * s_dy + (1.0 - a) * l_dy
-        final_dash = s_dash or (random.random() < dash_p * (1.0 - a))
-        final_break = s_break or (random.random() < brk_p * (1.0 - a))
+        # The AI has 100% control over dashing and breaking.
+        # It triggers them if its internal probability exceeds 50%.
+        final_dash = dash_p > 0.5
+        final_break = brk_p > 0.5
+
+        # Autopilot mechanic:
+        # If the AI outputs very low movement intent (magnitude < 0.2),
+        # it is effectively "designating autopilot" and letting the script take over.
+        ai_mag = math.sqrt(l_dx * l_dx + l_dy * l_dy)
+        if ai_mag < 0.2:
+            final_dx = s_dx
+            final_dy = s_dy
+        else:
+            # Otherwise, use the standard alpha blending
+            a = self.brain.alpha
+            final_dx = a * s_dx + (1.0 - a) * l_dx
+            final_dy = a * s_dy + (1.0 - a) * l_dy
 
         self._prev_obs = observation
         self._prev_obs_vec = obs_vec
