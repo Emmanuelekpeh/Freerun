@@ -47,6 +47,10 @@
   const MAX_PARTICLES = 300;
   let notifications = [];
   let shake = 0;
+  let exploredSectors = {};
+  let exploreBoard = null;
+  let exploreBoardTimer = 0;
+  const SECTOR_SIZE = 128;
   let ping = null; // {dx, dy, timer}
   let gameMode = GAME_MODE;
   let roomId = '';
@@ -178,6 +182,21 @@
           } else {
             notifications.push({ text: ev.player_name + ' got dash orb', time: 1.5, isMe: false });
           }
+        } else if (ev.type === 'explore_board') {
+          exploreBoard = ev.board;
+          exploreBoardTimer = 6.0;
+        }
+      }
+    }
+
+    // Track explored sectors for fog of war
+    var me = myId ? currPlayers[myId] : null;
+    if (me) {
+      var sx = Math.floor(me.x / SECTOR_SIZE);
+      var sy = Math.floor(me.y / SECTOR_SIZE);
+      for (var esx = sx - 1; esx <= sx + 1; esx++) {
+        for (var esy = sy - 1; esy <= sy + 1; esy++) {
+          exploredSectors[esx + ',' + esy] = true;
         }
       }
     }
@@ -337,6 +356,9 @@
       roundEnd.timer -= dt;
       if (roundEnd.timer <= 0) roundEnd = null;
     }
+    if (exploreBoardTimer > 0) {
+      exploreBoardTimer -= dt;
+    }
   }
 
   // ─── Render ────────────────────────────────────────────────────
@@ -413,6 +435,21 @@
         ctx.lineTo(cx - 5, cy);
         ctx.closePath();
         ctx.fill();
+      }
+    }
+
+    // Fog of war
+    var fogL = Math.floor((camX - W * 0.5) / SECTOR_SIZE) - 1;
+    var fogR = Math.ceil((camX + W * 0.5) / SECTOR_SIZE) + 1;
+    var fogT = Math.floor((camY - H * 0.5) / SECTOR_SIZE) - 1;
+    var fogB = Math.ceil((camY + H * 0.5) / SECTOR_SIZE) + 1;
+    for (var fsx = fogL; fsx <= fogR; fsx++) {
+      for (var fsy = fogT; fsy <= fogB; fsy++) {
+        if (!exploredSectors[fsx + ',' + fsy]) {
+          var fp = worldToScreen(fsx * SECTOR_SIZE, fsy * SECTOR_SIZE);
+          ctx.fillStyle = 'rgba(5,8,18,0.55)';
+          ctx.fillRect(fp[0], fp[1], SECTOR_SIZE, SECTOR_SIZE);
+        }
       }
     }
 
@@ -695,6 +732,42 @@
       ctx.fillText(n.text, W * 0.5, H * 0.35 + i * 36);
     }
     ctx.globalAlpha = 1;
+
+    // Exploration HUD
+    if (me) {
+      var myExplored = me.explored || 0;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#6af';
+      ctx.font = 'bold 11px "Segoe UI", sans-serif';
+      ctx.fillText('EXPLORED', 12, H - 38);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 16px "Segoe UI", sans-serif';
+      ctx.fillText(myExplored + ' sectors', 12, H - 22);
+    }
+
+    // Exploration leaderboard (fades in/out)
+    if (exploreBoard && exploreBoardTimer > 0) {
+      var lbAlpha = Math.min(1, exploreBoardTimer, exploreBoardTimer > 5 ? 1 : exploreBoardTimer / 1.0);
+      ctx.globalAlpha = lbAlpha * 0.85;
+      ctx.fillStyle = 'rgba(10,14,23,0.8)';
+      ctx.fillRect(W - 180, 50, 170, 20 + exploreBoard.length * 18);
+      ctx.globalAlpha = lbAlpha;
+      ctx.fillStyle = '#6af';
+      ctx.font = 'bold 11px "Segoe UI", sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('MAP EXPLORED', W - 172, 66);
+      for (var bi = 0; bi < exploreBoard.length; bi++) {
+        var entry = exploreBoard[bi];
+        var isMyEntry = entry.id === myId;
+        ctx.fillStyle = isMyEntry ? '#6af' : '#889';
+        ctx.font = (isMyEntry ? 'bold ' : '') + '11px "Segoe UI", sans-serif';
+        ctx.fillText((bi + 1) + '. ' + entry.name, W - 172, 82 + bi * 18);
+        ctx.textAlign = 'right';
+        ctx.fillText(entry.sectors, W - 18, 82 + bi * 18);
+        ctx.textAlign = 'left';
+      }
+      ctx.globalAlpha = 1;
+    }
 
     // Radar ping indicator
     if (ping) {

@@ -35,6 +35,10 @@ WORLD_BOUNDARY = 1200
 PING_AFTER_TICKS = 160           # 8 seconds at 20Hz
 PING_REPEAT_TICKS = 300          # 15 seconds between repeats
 
+# ─── Exploration Constants ───────────────────────────────────────────
+SECTOR_SIZE = 128
+EXPLORE_LEADERBOARD_TICKS = 100  # broadcast every 5 seconds
+
 # ─── Tick ────────────────────────────────────────────────────────────
 TICK_RATE = 20
 TICK_DT = 1.0 / TICK_RATE
@@ -115,6 +119,11 @@ class Player:
     it_ticks: int = 0
     last_tagged_by: str = ""
     tagged_by_timer: float = 0.0
+    explored: set = None
+
+    def __post_init__(self):
+        if self.explored is None:
+            self.explored = set()
 
 
 class Chunk:
@@ -487,6 +496,10 @@ class GameEngine:
 
             self._resolve_wall_collisions(p)
 
+            sx = int(math.floor(p.x / SECTOR_SIZE))
+            sy = int(math.floor(p.y / SECTOR_SIZE))
+            p.explored.add((sx, sy))
+
             if p.tag_cooldown > 0:
                 p.tag_cooldown -= TICK_DT
             if p.dash_cooldown > 0:
@@ -591,6 +604,21 @@ class GameEngine:
             else:
                 p.it_ticks = 0
 
+        # ── Exploration leaderboard ──
+        if self.tick_count % EXPLORE_LEADERBOARD_TICKS == 0 and self.players:
+            board = sorted(
+                self.players.values(),
+                key=lambda p: len(p.explored),
+                reverse=True,
+            )
+            self.events.append({
+                "type": "explore_board",
+                "board": [
+                    {"id": p.id, "name": p.name, "sectors": len(p.explored)}
+                    for p in board[:8]
+                ],
+            })
+
     # ── Serialization ────────────────────────────────────────────────
 
     def get_state(self) -> dict:
@@ -614,6 +642,7 @@ class GameEngine:
                     "dash_charges": p.dash_charges,
                     "dashing": p.dash_ticks_left > 0,
                     "break_cd": round(max(0, p.break_cooldown), 2),
+                    "explored": len(p.explored),
                 }
                 for p in self.players.values()
             ],
@@ -657,6 +686,19 @@ class GameEngine:
                         wty * TILE_SIZE,
                         TILE_SIZE,
                         TILE_SIZE,
+                    ))
+
+        cur_sx = int(math.floor(p.x / SECTOR_SIZE))
+        cur_sy = int(math.floor(p.y / SECTOR_SIZE))
+        unexplored_dirs = []
+        for usx in range(-2, 3):
+            for usy in range(-2, 3):
+                if usx == 0 and usy == 0:
+                    continue
+                if (cur_sx + usx, cur_sy + usy) not in p.explored:
+                    unexplored_dirs.append((
+                        usx * SECTOR_SIZE,
+                        usy * SECTOR_SIZE,
                     ))
 
         nearby_orbs = []
@@ -704,5 +746,7 @@ class GameEngine:
                 for o in nearest
             ],
             "walls_nearby": nearby_walls,
+            "unexplored_dirs": unexplored_dirs,
+            "explored_count": len(p.explored),
             "raycasts": self.raycast_distances(p.x, p.y),
         }

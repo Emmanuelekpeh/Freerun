@@ -314,14 +314,17 @@ class ScriptedBot:
         return move_dx, move_dy, dash, do_break
 
     def _roam(self, obs: dict) -> Tuple[float, float, bool, bool]:
-        """Move back toward the IT player / center of action at full speed."""
+        """Explore unvisited sectors, or move toward the action."""
+        unexplored = obs.get("unexplored_dirs", [])
         others = obs.get("nearest", [])
         it_players = [n for n in others if n["is_it"]]
 
-        if it_players:
+        if unexplored and random.random() < 0.7:
+            pick = random.choice(unexplored)
+            angle = math.atan2(pick[1], pick[0]) + random.uniform(-0.2, 0.2)
+        elif it_players:
             target = it_players[0]
             tdx, tdy = target["dx"], target["dy"]
-            d = math.sqrt(tdx * tdx + tdy * tdy) or 1.0
             angle = math.atan2(tdy, tdx) + random.uniform(-0.3, 0.3)
         else:
             sx = obs.get("self_x", 0)
