@@ -20,7 +20,7 @@ DASH_SPEED = 20.0
 DASH_COOLDOWN = 3.5
 DASH_TICKS = 3
 MAX_DASH_CHARGES = 3
-DASH_ORB_CHANCE = 0.035
+DASH_ORB_CHANCE = 0.005
 
 # ─── Break Constants ─────────────────────────────────────────────────
 BREAK_RADIUS = 48
