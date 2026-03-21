@@ -86,13 +86,9 @@ if st.session_state.page == "lobby":
             )
             mode = st.radio(
                 "Game Mode",
-                ["classic", "infestation", "hvb"],
+                ["classic", "infestation"],
                 horizontal=True,
-                captions=[
-                    "Tag swaps — 1 IT at a time",
-                    "IT spreads — last one standing wins",
-                    "Human vs Bot — tag for points",
-                ],
+                captions=["Tag swaps — 1 IT at a time", "IT spreads — last one standing wins"],
             )
             submitted = st.form_submit_button(
                 "PLAY", use_container_width=True, type="primary"

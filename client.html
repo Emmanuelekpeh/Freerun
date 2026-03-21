@@ -135,19 +135,13 @@
         if (ev.type === 'tag') {
           shake = 10;
           var isMe = ev.tagged_id === myId;
-          var isMeTagger = ev.tagger_id === myId;
           var text;
           if (gameMode === 'infestation') {
             text = isMe ? 'INFECTED!' : ev.tagged_name + ' infected!';
           } else {
             text = isMe ? "YOU'RE IT!" : ev.tagger_name + ' tagged ' + ev.tagged_name;
           }
-          if (ev.points && ev.points > 0) {
-            if (isMeTagger) {
-              text += '  +' + ev.points + 'pt' + (ev.points > 1 ? 's' : '');
-            }
-          }
-          notifications.push({ text: text, time: 3.0, isMe: isMe || isMeTagger });
+          notifications.push({ text: text, time: 3.0, isMe: isMe });
           if (ev.tagged_id === myId || ev.tagger_id === myId) ping = null;
         } else if (ev.type === 'ping' && ev.player_id === myId) {
           ping = { dx: ev.dx, dy: ev.dy, timer: 3.0 };
@@ -608,16 +602,6 @@
           ctx.font = 'bold 16px "Segoe UI", sans-serif';
           ctx.fillText('SURVIVE!', W * 0.5, 30);
         }
-      } else if (gameMode === 'hvb') {
-        if (me.is_it) {
-          ctx.fillStyle = '#ff4444';
-          ctx.font = 'bold 16px "Segoe UI", sans-serif';
-          ctx.fillText("YOU'RE IT! Tag humans for 2pts, bots for 1pt", W * 0.5, 30);
-        } else if (itPlayer) {
-          ctx.fillStyle = '#44cc88';
-          ctx.font = '14px "Segoe UI", sans-serif';
-          ctx.fillText('Run from ' + itPlayer.name + '!', W * 0.5, 30);
-        }
       } else {
         if (me.is_it) {
           ctx.fillStyle = '#ff4444';
@@ -759,40 +743,6 @@
       ctx.fillStyle = '#fff';
       ctx.font = 'bold 16px "Segoe UI", sans-serif';
       ctx.fillText(myExplored + ' sectors', 12, H - 22);
-    }
-
-    // HvB score display
-    if (gameMode === 'hvb' && me) {
-      ctx.textAlign = 'left';
-      ctx.fillStyle = '#fc4';
-      ctx.font = 'bold 11px "Segoe UI", sans-serif';
-      ctx.fillText('SCORE', 12, H - 68);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 18px "Segoe UI", sans-serif';
-      ctx.fillText((me.score || 0) + ' pts', 12, H - 52);
-
-      // Top scores sidebar
-      var sorted = Object.values(currPlayers).sort(function(a, b) { return (b.score || 0) - (a.score || 0); });
-      ctx.globalAlpha = 0.8;
-      ctx.fillStyle = 'rgba(10,14,23,0.75)';
-      var sbH = 20 + Math.min(sorted.length, 8) * 18;
-      ctx.fillRect(W - 165, 50, 155, sbH);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#fc4';
-      ctx.font = 'bold 11px "Segoe UI", sans-serif';
-      ctx.textAlign = 'left';
-      ctx.fillText('SCOREBOARD', W - 157, 66);
-      for (var si = 0; si < Math.min(sorted.length, 8); si++) {
-        var sp = sorted[si];
-        var isMyScore = sp.id === myId;
-        ctx.fillStyle = isMyScore ? '#fc4' : (sp.is_bot ? '#678' : '#aab');
-        ctx.font = (isMyScore ? 'bold ' : '') + '11px "Segoe UI", sans-serif';
-        ctx.textAlign = 'left';
-        ctx.fillText((si + 1) + '. ' + sp.name + (sp.is_bot ? ' [bot]' : ''), W - 157, 82 + si * 18);
-        ctx.textAlign = 'right';
-        ctx.fillText((sp.score || 0), W - 18, 82 + si * 18);
-        ctx.textAlign = 'left';
-      }
     }
 
     // Exploration leaderboard (fades in/out)

@@ -161,9 +161,6 @@ class ScriptedBot:
         if target.get("id") == self._locked_target_id and self._target_lock_timer > 0:
             score *= 1.6
 
-        if obs.get("game_mode") == "hvb" and not target.get("is_bot"):
-            score *= 1.8
-
         return score
 
     def _pick_target(self, obs: dict) -> dict:
@@ -449,14 +446,18 @@ class HybridBot:
 
         if now_it:
             r -= 0.05
-            if was_it and not now_it:
-                pass
-            if was_it and curr.get("tag_cooldown", 0) > prev.get("tag_cooldown", 0) + 0.5:
-                r += 5.0
         else:
             r += 0.1
-            if was_it and not now_it:
-                r += 5.0
+
+        prev_human_tags = prev.get("tagged_human_count", 0)
+        curr_human_tags = curr.get("tagged_human_count", 0)
+        if curr_human_tags > prev_human_tags:
+            r += 6.0 * (curr_human_tags - prev_human_tags)
+
+        prev_bot_tags = prev.get("tagged_bot_count", 0)
+        curr_bot_tags = curr.get("tagged_bot_count", 0)
+        if curr_bot_tags > prev_bot_tags:
+            r += 5.0 * (curr_bot_tags - prev_bot_tags)
 
         if not was_it and now_it:
             r -= 5.0
