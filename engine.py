@@ -642,7 +642,7 @@ class GameEngine:
         p = self.players[player_id]
         others = [o for o in self.players.values() if o.id != player_id]
         others.sort(key=lambda o: (o.x - p.x) ** 2 + (o.y - p.y) ** 2)
-        nearest = others[:5]
+        nearest = others[:10]
 
         tile_x = int(math.floor(p.x / TILE_SIZE))
         tile_y = int(math.floor(p.y / TILE_SIZE))

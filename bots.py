@@ -24,6 +24,9 @@ class ScriptedBot:
         self._locked_target_id = None
         self._target_lock_timer = 0.0
         self._patience_timer = 0.0
+        self._stuck_ticks = 0
+        self._last_x = 0.0
+        self._last_y = 0.0
 
         if self.personality == "hunter":
             self.aggression = random.uniform(0.8, 1.0)
@@ -52,7 +55,7 @@ class ScriptedBot:
 
     def get_action(self, observation: dict) -> Tuple[float, float, bool, bool]:
         if not observation or not observation.get("nearest"):
-            dx, dy = self._wander()
+            dx, dy = self._wander(observation)
             return dx, dy, False, False
 
         self.jitter_timer -= 0.05
@@ -63,6 +66,24 @@ class ScriptedBot:
         self._target_lock_timer = max(0, self._target_lock_timer - 0.05)
         self._patience_timer = max(0, self._patience_timer - 0.05)
 
+        sx = observation.get("self_x", 0)
+        sy = observation.get("self_y", 0)
+        dx_moved = sx - self._last_x
+        dy_moved = sy - self._last_y
+        if dx_moved * dx_moved + dy_moved * dy_moved < 1.0:
+            self._stuck_ticks += 1
+        else:
+            self._stuck_ticks = 0
+        self._last_x = sx
+        self._last_y = sy
+
+        if self._stuck_ticks > 10:
+            self._stuck_ticks = 0
+            self.wander_angle = random.uniform(0, 2 * math.pi)
+            burst_dx = math.cos(self.wander_angle)
+            burst_dy = math.sin(self.wander_angle)
+            return burst_dx, burst_dy, False, True
+
         orb_action = self._seek_orb(observation)
         if orb_action is not None:
             return orb_action
@@ -71,9 +92,19 @@ class ScriptedBot:
             return self._chase(observation)
         return self._flee(observation)
 
-    def _wander(self) -> Tuple[float, float]:
-        self.wander_angle += random.uniform(-0.2, 0.2)
-        return (math.cos(self.wander_angle) * 0.4, math.sin(self.wander_angle) * 0.4)
+    def _wander(self, obs: dict = None) -> Tuple[float, float]:
+        if obs:
+            sx = obs.get("self_x", 0)
+            sy = obs.get("self_y", 0)
+            dist_from_center = math.sqrt(sx * sx + sy * sy)
+            if dist_from_center > 200:
+                toward_center_x = -sx / dist_from_center
+                toward_center_y = -sy / dist_from_center
+                pull = min(1.0, (dist_from_center - 200) / 300)
+                self.wander_angle = math.atan2(toward_center_y, toward_center_x) + random.uniform(-0.4, 0.4) * (1 - pull)
+
+        self.wander_angle += random.uniform(-0.3, 0.3)
+        return (math.cos(self.wander_angle), math.sin(self.wander_angle))
 
     def _seek_orb(self, obs: dict):
         orbs = obs.get("nearby_orbs", [])
@@ -165,7 +196,7 @@ class ScriptedBot:
     def _chase(self, obs: dict) -> Tuple[float, float, bool, bool]:
         target = self._pick_target(obs)
         if not target:
-            dx, dy = self._wander()
+            dx, dy = self._wander(obs)
             return dx, dy, False, False
 
         dx, dy = target["dx"], target["dy"]
@@ -187,9 +218,8 @@ class ScriptedBot:
             base_angle += flank
 
         angle = base_angle + self.jitter_angle * 0.3
-        mag = min(1.0, self.aggression + 0.2)
-        move_dx = math.cos(angle) * mag
-        move_dy = math.sin(angle) * mag
+        move_dx = math.cos(angle)
+        move_dy = math.sin(angle)
 
         can_dash = obs.get("dash_cooldown", 1) <= 0 or obs.get("dash_charges", 0) > 0
         dash = (
@@ -221,27 +251,31 @@ class ScriptedBot:
 
         if dist < 50:
             self._patience_timer = 0
-            move_dx = nx * 1.0
-            move_dy = ny * 1.0
             can_d = obs.get("dash_cooldown", 1) <= 0 or obs.get("dash_charges", 0) > 0
             dash = can_d and random.random() < self.dash_eagerness
-            return move_dx, move_dy, dash, False
+            return nx, ny, dash, False
 
-        toward = 0.2 if dist > 100 else -0.1
+        toward = 0.3 if dist > 100 else -0.05
         move_dx = perp_x * 0.7 + nx * toward
         move_dy = perp_y * 0.7 + ny * toward
         mag = math.sqrt(move_dx * move_dx + move_dy * move_dy) or 1
-        move_dx = move_dx / mag * 0.6
-        move_dy = move_dy / mag * 0.6
+        move_dx = move_dx / mag * 0.85
+        move_dy = move_dy / mag * 0.85
         return move_dx, move_dy, False, False
 
     # ── Flee ──────────────────────────────────────────────────────────
 
     def _flee(self, obs: dict) -> Tuple[float, float, bool, bool]:
         threats = [n for n in obs["nearest"] if n["is_it"]]
+
         if not threats:
-            dx, dy = self._wander()
-            return dx, dy, False, False
+            return self._roam(obs)
+
+        closest = min(threats, key=lambda t: t["dx"] ** 2 + t["dy"] ** 2)
+        cdist = math.sqrt(closest["dx"] ** 2 + closest["dy"] ** 2)
+
+        if cdist > 200:
+            return self._roam(obs)
 
         flee_x, flee_y = 0.0, 0.0
         for t in threats:
@@ -257,16 +291,13 @@ class ScriptedBot:
             flee_y /= mag
 
         avoid_x, avoid_y = self._avoid_walls(obs)
-        move_x = flee_x * 0.7 + avoid_x * 0.3
-        move_y = flee_y * 0.7 + avoid_y * 0.3
+        move_x = flee_x * 0.8 + avoid_x * 0.2
+        move_y = flee_y * 0.8 + avoid_y * 0.2
 
-        angle = math.atan2(move_y, move_x) + self.jitter_angle
-        mag = min(1.0, math.sqrt(move_x ** 2 + move_y ** 2) + 0.1)
-        move_dx = math.cos(angle) * mag
-        move_dy = math.sin(angle) * mag
+        angle = math.atan2(move_y, move_x) + self.jitter_angle * 0.5
+        move_dx = math.cos(angle)
+        move_dy = math.sin(angle)
 
-        closest = threats[0]
-        cdist = math.sqrt(closest["dx"] ** 2 + closest["dy"] ** 2)
         can_dash_f = obs.get("dash_cooldown", 1) <= 0 or obs.get("dash_charges", 0) > 0
         dash = (
             cdist < 65
@@ -281,6 +312,35 @@ class ScriptedBot:
             and random.random() < 0.5
         )
         return move_dx, move_dy, dash, do_break
+
+    def _roam(self, obs: dict) -> Tuple[float, float, bool, bool]:
+        """Move back toward the IT player / center of action at full speed."""
+        others = obs.get("nearest", [])
+        it_players = [n for n in others if n["is_it"]]
+
+        if it_players:
+            target = it_players[0]
+            tdx, tdy = target["dx"], target["dy"]
+            d = math.sqrt(tdx * tdx + tdy * tdy) or 1.0
+            angle = math.atan2(tdy, tdx) + random.uniform(-0.3, 0.3)
+        else:
+            sx = obs.get("self_x", 0)
+            sy = obs.get("self_y", 0)
+            angle = math.atan2(-sy, -sx) + random.uniform(-0.4, 0.4)
+
+        move_dx = math.cos(angle)
+        move_dy = math.sin(angle)
+
+        avoid_x, avoid_y = self._avoid_walls(obs)
+        move_dx = move_dx * 0.85 + avoid_x * 0.15
+        move_dy = move_dy * 0.85 + avoid_y * 0.15
+
+        do_break = (
+            obs.get("break_cooldown", 1) <= 0
+            and self._walls_ahead(obs, move_dx, move_dy)
+            and random.random() < 0.5
+        )
+        return move_dx, move_dy, False, do_break
 
     # ── Helpers ───────────────────────────────────────────────────────
 
