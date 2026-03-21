@@ -10,7 +10,8 @@ from aiohttp import web
 import aiohttp
 
 from engine import GameEngine, TICK_RATE, TICK_DT
-from bots import ScriptedBot, RLBot
+from bots import HybridBot
+from brain import BotBrain
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8765))
@@ -18,8 +19,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MIN_PLAYERS = 4
 MAX_PLAYERS = 8
 ROOM_IDLE_TIMEOUT = 30.0
-
-POLICY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_policy.pt")
 
 PSYCHOLOGIST_NAMES = [
     "Freud", "Jung", "Pavlov", "Skinner", "Maslow",
@@ -45,12 +44,11 @@ PSYCHOLOGIST_NAMES = [
 ]
 
 
+_shared_brain = BotBrain.shared()
+
+
 def _make_bot_brain():
-    if os.path.exists(POLICY_PATH):
-        bot = RLBot(POLICY_PATH)
-        if bot.policy is not None:
-            return bot
-    return ScriptedBot()
+    return HybridBot(brain=_shared_brain)
 
 
 # ─── Game Room ────────────────────────────────────────────────────────
@@ -363,6 +361,7 @@ async def cleanup_game_loop(app):
         await app["game_loop"]
     except asyncio.CancelledError:
         pass
+    _shared_brain.save()
 
 
 def main():

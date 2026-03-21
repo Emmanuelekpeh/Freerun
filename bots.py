@@ -1,13 +1,10 @@
 import math
-import os
 import random
 from typing import Tuple
 
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
+import numpy as np
+
+from brain import BotBrain, encode_obs
 
 
 PERSONALITY_TYPES = ("hunter", "strategist", "trickster", "timid")
@@ -393,38 +390,80 @@ class ScriptedBot:
         return (ax, ay)
 
 
-class RLBot:
-    """Bot driven by a trained PyTorch policy. Falls back to ScriptedBot if no model."""
+class HybridBot:
+    """ScriptedBot baseline + learned neural net that improves from live games.
 
-    def __init__(self, policy_path: str = None):
-        self._fallback = ScriptedBot()
-        self.policy = None
+    The blend starts heavily scripted (alpha=0.8) and gradually shifts
+    toward the learned policy as training accumulates. Every tick, the
+    bot records (obs, action, reward) into the shared BotBrain's replay
+    buffer. Training happens automatically every N ticks.
+    """
 
-        if not TORCH_AVAILABLE:
-            return
-
-        path = policy_path or os.path.join(os.path.dirname(__file__), "best_policy.pt")
-        if os.path.exists(path):
-            try:
-                from training import PolicyNetwork, encode_observation
-                self._encode = encode_observation
-                self.policy = PolicyNetwork()
-                self.policy.load_state_dict(torch.load(path, weights_only=True))
-                self.policy.eval()
-            except Exception:
-                self.policy = None
+    def __init__(self, brain: BotBrain = None, personality: str = None):
+        self.scripted = ScriptedBot(personality=personality)
+        self.brain = brain or BotBrain.shared()
+        self._prev_obs: dict = None
+        self._prev_obs_vec: np.ndarray = None
+        self._prev_action: np.ndarray = None
 
     def get_action(self, observation: dict) -> Tuple[float, float, bool, bool]:
-        if self.policy is None:
-            return self._fallback.get_action(observation)
+        if not observation:
+            return self.scripted.get_action(observation)
 
-        import torch as th
-        obs_vec = self._encode(observation)
-        obs_t = th.from_numpy(obs_vec).unsqueeze(0)
-        with th.no_grad():
-            move_mu, log_std, dash_logit, break_logit, _ = self.policy(obs_t)
-        dx = float(th.tanh(move_mu[0, 0]))
-        dy = float(th.tanh(move_mu[0, 1]))
-        dash = float(th.sigmoid(dash_logit[0, 0])) > 0.5
-        do_break = float(th.sigmoid(break_logit[0, 0])) > 0.5
-        return dx, dy, dash, do_break
+        obs_vec = encode_obs(observation)
+
+        if self._prev_obs is not None:
+            reward = self._compute_reward(self._prev_obs, observation)
+            self.brain.record(self._prev_obs_vec, self._prev_action, reward)
+
+        s_dx, s_dy, s_dash, s_break = self.scripted.get_action(observation)
+        l_dx, l_dy, dash_p, brk_p = self.brain.get_action(obs_vec)
+
+        a = self.brain.alpha
+        final_dx = a * s_dx + (1.0 - a) * l_dx
+        final_dy = a * s_dy + (1.0 - a) * l_dy
+        final_dash = s_dash or (random.random() < dash_p * (1.0 - a))
+        final_break = s_break or (random.random() < brk_p * (1.0 - a))
+
+        self._prev_obs = observation
+        self._prev_obs_vec = obs_vec
+        self._prev_action = np.array([
+            final_dx, final_dy,
+            1.0 if final_dash else 0.0,
+            1.0 if final_break else 0.0,
+        ], dtype=np.float32)
+
+        self.brain.maybe_train()
+
+        return final_dx, final_dy, final_dash, final_break
+
+    @staticmethod
+    def _compute_reward(prev: dict, curr: dict) -> float:
+        r = 0.0
+
+        was_it = prev.get("is_it", False)
+        now_it = curr.get("is_it", False)
+
+        if now_it:
+            r -= 0.05
+            if was_it and not now_it:
+                pass
+            if was_it and curr.get("tag_cooldown", 0) > prev.get("tag_cooldown", 0) + 0.5:
+                r += 5.0
+        else:
+            r += 0.1
+            if was_it and not now_it:
+                r += 5.0
+
+        if not was_it and now_it:
+            r -= 5.0
+
+        prev_exp = prev.get("explored_count", 0)
+        curr_exp = curr.get("explored_count", 0)
+        if curr_exp > prev_exp:
+            r += 0.2 * (curr_exp - prev_exp)
+
+        if curr.get("dash_charges", 0) > prev.get("dash_charges", 0):
+            r += 0.5
+
+        return r
