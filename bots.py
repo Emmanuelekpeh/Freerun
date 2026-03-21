@@ -161,6 +161,9 @@ class ScriptedBot:
         if target.get("id") == self._locked_target_id and self._target_lock_timer > 0:
             score *= 1.6
 
+        if obs.get("game_mode") == "hvb" and not target.get("is_bot"):
+            score *= 1.8
+
         return score
 
     def _pick_target(self, obs: dict) -> dict:

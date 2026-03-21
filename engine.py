@@ -30,6 +30,8 @@ BREAK_COOLDOWN = 1.0
 TAG_RADIUS = 30
 TAG_COOLDOWN = 3.0
 WORLD_BOUNDARY = 1200
+TAG_SCORE_HUMAN = 2
+TAG_SCORE_BOT = 1
 
 # ─── Ping Constants ──────────────────────────────────────────────────
 PING_AFTER_TICKS = 160           # 8 seconds at 20Hz
@@ -119,6 +121,7 @@ class Player:
     it_ticks: int = 0
     last_tagged_by: str = ""
     tagged_by_timer: float = 0.0
+    score: int = 0
     explored: set = None
 
     def __post_init__(self):
@@ -571,12 +574,19 @@ class GameEngine:
                         b.last_tagged_by = a.id
                         b.tagged_by_timer = 6.0
                         a.it_ticks = 0
+
+                        pts = 0
+                        if self.game_mode == "hvb":
+                            pts = TAG_SCORE_HUMAN if not b.is_bot else TAG_SCORE_BOT
+                            a.score += pts
+
                         self.events.append({
                             "type": "tag",
                             "tagger_id": a.id,
                             "tagged_id": b.id,
                             "tagger_name": a.name,
                             "tagged_name": b.name,
+                            "points": pts,
                         })
                         tag_happened = True
                         break
@@ -642,6 +652,7 @@ class GameEngine:
                     "dash_charges": p.dash_charges,
                     "dashing": p.dash_ticks_left > 0,
                     "break_cd": round(max(0, p.break_cooldown), 2),
+                    "score": p.score,
                     "explored": len(p.explored),
                 }
                 for p in self.players.values()
@@ -732,6 +743,7 @@ class GameEngine:
             "it_ticks": p.it_ticks,
             "last_tagged_by": p.last_tagged_by,
             "nearby_orbs": nearby_orbs,
+            "game_mode": self.game_mode,
             "nearest": [
                 {
                     "id": o.id,
@@ -740,6 +752,7 @@ class GameEngine:
                     "vx": o.vx,
                     "vy": o.vy,
                     "is_it": o.is_it,
+                    "is_bot": o.is_bot,
                     "dash_cd": o.dash_cooldown,
                     "is_dashing": o.dash_ticks_left > 0,
                 }

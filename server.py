@@ -242,6 +242,7 @@ button:hover{background:#00cc78}
 <div class="modes">
 <label><input type="radio" name="mode" value="classic" checked><span>Classic</span></label>
 <label><input type="radio" name="mode" value="infestation"><span>Infestation</span></label>
+<label><input type="radio" name="mode" value="hvb"><span>Human vs Bot</span></label>
 </div>
 <button type="submit">PLAY</button>
 </form>
@@ -276,7 +277,7 @@ async def handle_lobby(request):
 async def handle_play(request):
     name = request.query.get("name", "Player")[:16]
     mode = request.query.get("mode", "classic")
-    if mode not in ("classic", "infestation"):
+    if mode not in ("classic", "infestation", "hvb"):
         mode = "classic"
     ws_url = _ws_url_from_request(request)
     html = _build_game_html(name, mode, ws_url)
@@ -301,7 +302,7 @@ async def handle_ws(request):
             if msg.get("type") == "join" and room is None:
                 name = str(msg.get("name", "Player"))[:16]
                 req_mode = str(msg.get("mode", "classic"))
-                if req_mode not in ("classic", "infestation"):
+                if req_mode not in ("classic", "infestation", "hvb"):
                     req_mode = "classic"
 
                 room = _game_server.manager.find_or_create(req_mode)
